@@ -1,0 +1,64 @@
+id: ops-onboarding-basic
+name: Ops Onboarding (basic)
+version: 1
+policy_profile: enterprise-default
+execution_profile: remote-install
+default_timeout_s: 120
+
+inputs:
+  admin_user:
+    question:
+      prompt: "온보딩할 관리자 계정명(admin_user)을 입력해줘 (예: opsadmin)"
+  ssh_pubkey:
+    question:
+      prompt: "등록할 SSH public key(ssh_pubkey)를 붙여줘 (ssh-ed25519... 또는 ssh-rsa...)"
+  pkg_manager:
+    question:
+      prompt: "패키지 매니저를 선택해줘 (apt/dnf/yum)"
+  target_os:
+    question:
+      prompt: "대상 OS를 선택해줘 (ubuntu/debian/rhel/rocky/centos)"
+
+steps:
+  - id: precheck
+    kind: commands
+    commands:
+      - "uname -a"
+      - "id"
+      - "cat /etc/os-release || true"
+      - "command -v sudo || true"
+      - "command -v {{pkg_manager}} || true"
+
+  - id: user
+    kind: commands
+    commands:
+      # useradd/adduser는 배포판마다 다를 수 있어서 둘 다 시도(없으면 무시)
+      - "id {{admin_user}} 2>/dev/null || (useradd -m -s /bin/bash {{admin_user}} 2>/dev/null || adduser --disabled-password --gecos '' {{admin_user}} 2>/dev/null || true)"
+      - "mkdir -p /home/{{admin_user}}/.ssh && chmod 700 /home/{{admin_user}}/.ssh"
+      - "echo '{{ssh_pubkey}}' >> /home/{{admin_user}}/.ssh/authorized_keys"
+      - "chmod 600 /home/{{admin_user}}/.ssh/authorized_keys"
+      - "chown -R {{admin_user}}:{{admin_user}} /home/{{admin_user}}/.ssh || true"
+
+  - id: packages
+    kind: commands
+    commands:
+      # 최소 업데이트(실서비스면 승인게이트 붙여야 하는데, 일단 basic는 실행만)
+      - "({{pkg_manager}} update -y 2>/dev/null || {{pkg_manager}} update 2>/dev/null || true)"
+      - "({{pkg_manager}} install -y curl ca-certificates jq 2>/dev/null || true)"
+
+  - id: validate
+    kind: commands
+    commands:
+      - "id {{admin_user}}"
+      - "test -f /home/{{admin_user}}/.ssh/authorized_keys && echo OK || (echo FAIL; exit 1)"
+      - "tail -n 1 /home/{{admin_user}}/.ssh/authorized_keys || true"
+      - "command -v curl && command -v jq && echo TOOLS_OK || true"
+
+validate:
+  pass_if:
+    - rule: exit_code_all_zero
+
+evidence:
+  include:
+    - audit
+    - evidence_files

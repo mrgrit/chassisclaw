@@ -1,0 +1,85 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-opsclaw}
+      POSTGRES_USER: ${POSTGRES_USER:-opsclaw}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-opsclaw} -d ${POSTGRES_DB:-opsclaw}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build: ./core/manager_api
+    env_file:
+      - .env
+    environment:
+      # DB URL도 env에서 주입되는 값으로 구성(하드코딩 제거)
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-opsclaw}:${POSTGRES_PASSWORD:-change-me}@db:5432/${POSTGRES_DB:-opsclaw}
+
+      # internal service
+      SUBAGENT_URL: http://subagent:${SUBAGENT_PORT:-55123}
+
+      # local stores
+      STATE_DIR: /data/state
+      ARTIFACT_DIR: /data/artifacts
+      EVIDENCE_DIR: /data/evidence
+      AUDIT_DIR: /data/audit
+
+      # policies
+      MASTERGATE_PROFILE: ${MASTERGATE_PROFILE:-enterprise-default}
+      MASTER_TIMEOUT_S: ${MASTER_TIMEOUT_S:-60}
+
+      # master providers (all from .env)
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.1:8b}
+
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4.1-mini}
+
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-3-5-sonnet-latest}
+
+    # Ubuntu에서 host.docker.internal 쓰려면 필요
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    volumes:
+      - ./data:/data
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${API_PORT:-8000}:8000"
+
+  subagent:
+    build: ./subagent
+    env_file:
+      - .env
+    environment:
+      AGENT_ID: local-agent-1
+      EVIDENCE_DIR: /data/evidence
+      MAX_OUTPUT_BYTES: "200000"
+    volumes:
+      - ./data:/data
+    ports:
+      - "${SUBAGENT_PORT:-55123}:55123"
+
+  web:
+    build: ./web
+    env_file:
+      - .env
+    environment:
+      # 컨테이너 내부에서 api 서비스명으로 접근
+      API_BASE: http://api:8000
+    depends_on:
+      - api
+    ports:
+      - "${WEB_PORT:-80}:80"
+
+volumes:
+  db_data:  

@@ -1,0 +1,164 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>OpsClaw Console</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 24px; }
+    .row { display:flex; gap:16px; flex-wrap: wrap; }
+    .card { border:1px solid #ddd; border-radius: 10px; padding:16px; background:#fff; flex: 1; min-width: 520px; }
+    input[type=text], input[type=number] { width: 100%; padding: 8px; box-sizing: border-box; }
+    button { padding: 8px 12px; cursor:pointer; }
+    pre { background:#f7f7f7; padding:12px; border-radius:8px; overflow:auto; max-height: 520px; }
+    .muted { color:#666; }
+    label { font-size: 12px; color:#444; }
+    .authbar { display:flex; gap:10px; align-items:flex-end; flex-wrap: wrap; margin: 10px 0 6px; }
+    .authbar > div { min-width: 220px; }
+    .inline { display:flex; gap:10px; align-items:center; flex-wrap: wrap; }
+    .pill { display:inline-block; padding:6px 10px; border-radius:10px; border:1px solid #ddd; background:#fafafa; }
+    .ok { border-color:#0a0; }
+    .warn { border-color:#aa0; }
+    .bad { border-color:#a00; }
+    .btnrow { display:flex; gap:10px; align-items:center; flex-wrap: wrap; }
+  </style>
+</head>
+<body>
+  <%
+    const _token = (typeof token !== "undefined" && token) ? token : "";
+    const _actor = (typeof actor !== "undefined" && actor) ? actor : "";
+    const _api = (typeof api !== "undefined" && api) ? api : "";
+    const _error = (typeof error !== "undefined" && error) ? error : null;
+
+    const _created = (typeof created !== "undefined" && created) ? created : null;
+    const _loaded = (typeof loaded !== "undefined" && loaded) ? loaded : null;
+    const _workflow = (typeof workflow !== "undefined" && workflow) ? workflow : null;
+
+    const _last_request_text = (typeof last_request_text !== "undefined" && last_request_text) ? last_request_text : "basic health check";
+    const _last_project_id = (typeof last_project_id !== "undefined" && last_project_id) ? last_project_id : "";
+    const _last_workflow_project_id = (typeof last_workflow_project_id !== "undefined" && last_workflow_project_id) ? last_workflow_project_id : "";
+    const _last_workflow_request = (typeof last_workflow_request !== "undefined" && last_workflow_request) ? last_workflow_request : "basic system snapshot";
+    const _last_timeout_s = (typeof last_timeout_s !== "undefined" && last_timeout_s) ? last_timeout_s : 60;
+    const _last_max_retries = (typeof last_max_retries !== "undefined" && last_max_retries) ? last_max_retries : 2;
+  %>
+
+  <h1>OpsClaw Console</h1>
+  <p class="muted">API: <%= _api %> | <a href="/mastergate">MasterGate</a></p>
+
+  <div class="card" style="margin-bottom:16px;">
+    <h3>Auth (RBAC token)</h3>
+
+    <form class="authbar" method="post" action="/auth/save">
+      <input type="hidden" name="next" value="/" />
+
+      <div>
+        <label for="authToken">API Token (x-opsclaw-token)</label>
+        <input id="authToken" name="token" type="text" placeholder="admin123 / appr123 / op123" value="<%= _token %>" autocomplete="off" />
+      </div>
+
+      <div>
+        <label for="authActor">Actor (x-opsclaw-actor)</label>
+        <input id="authActor" name="actor" type="text" placeholder="admin / approver01 / ops01" value="<%= _actor %>" autocomplete="off" />
+      </div>
+
+      <div>
+        <button type="submit">Save</button>
+      </div>
+
+      <div class="muted" style="min-width:320px;">
+        Saved in cookies (<code>opsclaw_token</code>, <code>opsclaw_actor</code>). Used for server-side API calls.
+      </div>
+    </form>
+
+    <div class="inline" style="margin-top:10px;">
+      <% if (_token) { %>
+        <span class="pill ok"><b>Token</b>: <span class="muted">set</span></span>
+      <% } else { %>
+        <span class="pill warn"><b>Token</b>: <span class="muted">empty</span></span>
+      <% } %>
+
+      <% if (_actor) { %>
+        <span class="pill ok"><b>Actor</b>: <span class="muted"><%= _actor %></span></span>
+      <% } else { %>
+        <span class="pill warn"><b>Actor</b>: <span class="muted">empty</span></span>
+      <% } %>
+    </div>
+  </div>
+
+  <% if (_error) { %>
+    <div class="card" style="border-color:#c00; margin-bottom:16px;">
+      <b>Error</b>
+      <pre><%= _error %></pre>
+      <div class="muted">If this is 401/403, save token first. If 404/405, web/server.js routes are missing.</div>
+    </div>
+  <% } %>
+
+  <div class="row">
+    <div class="card">
+      <h3>1) Create Project</h3>
+      <form method="post" action="/projects/create">
+        <label for="reqText">Request text</label>
+        <input id="reqText" type="text" name="request_text" value="<%= _last_request_text %>" />
+        <p class="btnrow">
+          <button type="submit">Create</button>
+          <span class="muted">Creates a new project and shows returned JSON below.</span>
+        </p>
+      </form>
+
+      <h3 style="margin-top:18px;">2) Load Project</h3>
+      <form method="post" action="/projects/load">
+        <label for="loadPid">Project ID</label>
+        <div style="display:flex; gap:10px;">
+          <input id="loadPid" type="text" name="project_id" placeholder="paste project_id" value="<%= _last_project_id %>" />
+          <button type="submit">Load</button>
+        </div>
+      </form>
+    </div>
+
+    <div class="card">
+      <h3>3) Run Workflow (LangGraph)</h3>
+      <form method="post" action="/projects/run_workflow">
+        <label for="wfPid">Project ID</label>
+        <input id="wfPid" type="text" name="project_id" placeholder="required" value="<%= _last_workflow_project_id %>" />
+
+        <label for="wfReq">Workflow request</label>
+        <input id="wfReq" type="text" name="workflow_request" value="<%= _last_workflow_request %>" />
+
+        <div style="display:flex; gap:10px;">
+          <div style="flex:1;">
+            <label for="wfTimeout">Timeout (sec)</label>
+            <input id="wfTimeout" type="number" name="timeout_s" value="<%= _last_timeout_s %>" min="5" max="600" />
+          </div>
+          <div style="flex:1;">
+            <label for="wfRetries">Max retries</label>
+            <input id="wfRetries" type="number" name="max_retries" value="<%= _last_max_retries %>" min="0" max="10" />
+          </div>
+        </div>
+
+        <p class="btnrow">
+          <button type="submit">Run Workflow</button>
+          <span class="muted">Returns summary JSON.</span>
+        </p>
+      </form>
+
+      <div class="muted">Run workflow to see summary below.</div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:16px;">
+    <h3>Project State (latest)</h3>
+
+    <% if (_created) { %>
+      <b>Created</b>
+      <pre><%= JSON.stringify(_created, null, 2) %></pre>
+    <% } else if (_loaded) { %>
+      <b>Loaded</b>
+      <pre><%= JSON.stringify(_loaded, null, 2) %></pre>
+    <% } else if (_workflow) { %>
+      <b>Workflow Summary</b>
+      <pre><%= JSON.stringify(_workflow, null, 2) %></pre>
+    <% } else { %>
+      <div class="muted">Create or load a project to view state.</div>
+    <% } %>
+  </div>
+</body>
+</html>
