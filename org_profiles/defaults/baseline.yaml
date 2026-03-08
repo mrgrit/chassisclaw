@@ -1,0 +1,7 @@
+name: baseline
+internal_cidrs: []
+log_retention_days: 90
+maintenance_window: ""
+approval_required_for:
+  - firewall_change
+  - service_restart
