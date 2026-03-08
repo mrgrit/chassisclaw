@@ -1,13 +1,14 @@
 import json
 from pathlib import Path
-from typing import Any
 
-def read_json(path: Path, default: Any):
+def read_json(path: Path, default=None):
     if not path.exists():
-        return default
+        return {} if default is None else default
     return json.loads(path.read_text(encoding="utf-8"))
 
-def write_json(path: Path, payload: Any):
+def write_json(path: Path, payload):
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    return payload
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8",
+    )

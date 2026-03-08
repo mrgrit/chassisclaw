@@ -3,26 +3,87 @@ from app.models.playbook_ir import PlaybookIR
 
 class ValidationService:
     def validate(self, project: dict, plan_ir: PlaybookIR, last_result: dict | None = None) -> dict:
-        # 아직 모르는 입력이 남아 있으면 완료 아님
+        if last_result is None:
+            if plan_ir.unknowns:
+                return {
+                    "ok": False,
+                    "reason": "unknowns_remaining",
+                    "retryable": False,
+                    "next_stage": "resolve",
+                    "unknowns": list(plan_ir.unknowns),
+                }
+            return {
+                "ok": False,
+                "reason": "no_action_taken",
+                "retryable": False,
+                "next_stage": "replan",
+            }
+
+        exit_code = int(last_result.get("exit_code", 0))
+        stderr = (last_result.get("stderr", "") or "").lower()
+        stdout = (last_result.get("stdout", "") or "").lower()
+        text = f"{stdout}\n{stderr}"
+
+        if exit_code != 0:
+            retryable_keywords = [
+                "temporary failure",
+                "temporarily unavailable",
+                "try again",
+                "timed out",
+                "timeout",
+                "connection reset",
+                "network is unreachable",
+                "name or service not known",
+            ]
+
+            non_retryable_keywords = [
+                "command not found",
+                "permission denied",
+                "not permitted",
+                "invalid option",
+                "unknown option",
+                "no such file or directory",
+                "syntax error",
+            ]
+
+            if any(k in text for k in non_retryable_keywords):
+                return {
+                    "ok": False,
+                    "reason": "last_action_failed",
+                    "retryable": False,
+                    "next_stage": "replan",
+                    "exit_code": exit_code,
+                }
+
+            if any(k in text for k in retryable_keywords):
+                return {
+                    "ok": False,
+                    "reason": "last_action_failed",
+                    "retryable": True,
+                    "next_stage": "retry",
+                    "exit_code": exit_code,
+                }
+
+            return {
+                "ok": False,
+                "reason": "last_action_failed",
+                "retryable": False,
+                "next_stage": "replan",
+                "exit_code": exit_code,
+            }
+
         if plan_ir.unknowns:
             return {
                 "ok": False,
                 "reason": "unknowns_remaining",
-                "retryable": True,
+                "retryable": False,
+                "next_stage": "resolve",
                 "unknowns": list(plan_ir.unknowns),
-            }
-
-        # 마지막 실행이 실패면 replan 진입 가능
-        if last_result and int(last_result.get("exit_code", 0)) != 0:
-            return {
-                "ok": False,
-                "reason": "last_action_failed",
-                "retryable": True,
-                "exit_code": int(last_result.get("exit_code", 0)),
             }
 
         return {
             "ok": True,
-            "reason": "minimal_validation_passed",
+            "reason": "passed",
             "retryable": False,
+            "next_stage": "resolve",
         }

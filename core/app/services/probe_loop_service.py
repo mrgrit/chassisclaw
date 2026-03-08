@@ -14,6 +14,7 @@ class ProbeLoopService:
 
     def run(self, project: dict, target: dict, max_iterations: int = 3) -> dict:
         plan_ir = PlaybookIR(**project["plan_ir"])
+        retry_count = int(project.get("retry_count", 0) or 0)
 
         for i in range(max_iterations):
             plan_ir.iterations += 1
@@ -36,7 +37,11 @@ class ProbeLoopService:
                 project["resolution"] = resolution.model_dump()
                 project["status"] = "needs_clarification"
                 project["stage"] = "resolve"
-                return {"status": "needs_clarification", "stage": "resolve", "resolution": resolution.model_dump()}
+                return {
+                    "status": "needs_clarification",
+                    "stage": "resolve",
+                    "resolution": resolution.model_dump(),
+                }
 
             if action_ir.approval_request:
                 resolution = Resolution(
@@ -48,7 +53,11 @@ class ProbeLoopService:
                 project["resolution"] = resolution.model_dump()
                 project["status"] = "needs_approval"
                 project["stage"] = "resolve"
-                return {"status": "needs_approval", "stage": "resolve", "resolution": resolution.model_dump()}
+                return {
+                    "status": "needs_approval",
+                    "stage": "resolve",
+                    "resolution": resolution.model_dump(),
+                }
 
             if action_ir.resolved_inputs:
                 if hasattr(self, "_apply_resolved_inputs"):
@@ -81,7 +90,7 @@ class ProbeLoopService:
                 validation = (
                     self.validation_service.validate(project, plan_ir, None)
                     if getattr(self, "validation_service", None)
-                    else {"ok": True, "reason": "validation_service_disabled", "retryable": False}
+                    else {"ok": True, "reason": "validation_service_disabled", "retryable": False, "next_stage": "resolve"}
                 )
 
                 project["plan_ir"] = plan_ir.model_dump()
@@ -89,10 +98,21 @@ class ProbeLoopService:
                 project["validation"] = validation
 
                 if validation["ok"]:
+                    project["retry_count"] = 0
                     project["status"] = "resolved"
                     project["stage"] = "resolve"
                     return {
                         "status": "resolved",
+                        "stage": "resolve",
+                        "resolution": resolution.model_dump(),
+                        "validation": validation,
+                    }
+
+                if validation.get("next_stage") == "resolve":
+                    project["status"] = "needs_clarification"
+                    project["stage"] = "resolve"
+                    return {
+                        "status": "needs_clarification",
                         "stage": "resolve",
                         "resolution": resolution.model_dump(),
                         "validation": validation,
@@ -107,7 +127,11 @@ class ProbeLoopService:
                     "validation": validation,
                 }
 
+            any_action_executed = False
+
             for action in action_ir.actions:
+                any_action_executed = True
+
                 if action.type != "shell":
                     raise ValueError(f"unsupported action type in M1: {action.type}")
 
@@ -127,6 +151,100 @@ class ProbeLoopService:
                         "exit_code": result.exit_code,
                     }
                 )
+
+                validation = (
+                    self.validation_service.validate(project, plan_ir, result.model_dump())
+                    if getattr(self, "validation_service", None)
+                    else {"ok": True, "reason": "validation_service_disabled", "retryable": False, "next_stage": "resolve"}
+                )
+                project["validation"] = validation
+                project["last_result"] = result.model_dump()
+
+                if not validation["ok"]:
+                    if validation.get("next_stage") == "retry" and retry_count < 1:
+                        project["retry_count"] = retry_count + 1
+                        self.audit_service.append(
+                            project["id"],
+                            "ACTION_RETRY_SCHEDULED",
+                            {
+                                "action_id": action.id,
+                                "retry_count": project["retry_count"],
+                                "reason": validation["reason"],
+                            },
+                        )
+
+                        retry_result = self.subagent_client.run_script(
+                            base_url=target["base_url"],
+                            run_id=f"run_{uuid.uuid4().hex[:8]}",
+                            target_id=target["id"],
+                            script=action.script or "",
+                            timeout_s=action.timeout_s,
+                        )
+
+                        retry_ev_ref = self.evidence_service.save_tool_result(project["id"], retry_result)
+                        plan_ir.evidence.append(
+                            {
+                                "action_id": action.id,
+                                "evidence_ref": retry_ev_ref,
+                                "exit_code": retry_result.exit_code,
+                                "retry": True,
+                            }
+                        )
+                        project["last_result"] = retry_result.model_dump()
+
+                        retry_validation = (
+                            self.validation_service.validate(project, plan_ir, retry_result.model_dump())
+                            if getattr(self, "validation_service", None)
+                            else {"ok": True, "reason": "validation_service_disabled", "retryable": False, "next_stage": "resolve"}
+                        )
+                        project["validation"] = retry_validation
+                        project["plan_ir"] = plan_ir.model_dump()
+
+                        if retry_validation["ok"]:
+                            project["retry_count"] = 0
+                            project["status"] = "resolved"
+                            project["stage"] = "resolve"
+                            return {
+                                "status": "resolved",
+                                "stage": "resolve",
+                                "validation": retry_validation,
+                            }
+
+                        if retry_validation.get("next_stage") == "resolve":
+                            project["status"] = "needs_clarification"
+                            project["stage"] = "resolve"
+                            return {
+                                "status": "needs_clarification",
+                                "stage": "resolve",
+                                "validation": retry_validation,
+                            }
+
+                        project["status"] = "failed"
+                        project["stage"] = "replan"
+                        return {
+                            "status": "failed",
+                            "stage": "replan",
+                            "validation": retry_validation,
+                        }
+
+                    project["plan_ir"] = plan_ir.model_dump()
+
+                    if validation.get("next_stage") == "resolve":
+                        project["status"] = "needs_clarification"
+                        project["stage"] = "resolve"
+                        return {
+                            "status": "needs_clarification",
+                            "stage": "resolve",
+                            "validation": validation,
+                        }
+
+                    project["status"] = "failed"
+                    project["stage"] = "replan"
+                    return {
+                        "status": "failed",
+                        "stage": "replan",
+                        "validation": validation,
+                    }
 
                 followup = self._ask_master_after_probe(
                     llm_conn,
@@ -178,7 +296,7 @@ class ProbeLoopService:
                     validation = (
                         self.validation_service.validate(project, plan_ir, result.model_dump())
                         if getattr(self, "validation_service", None)
-                        else {"ok": True, "reason": "validation_service_disabled", "retryable": False}
+                        else {"ok": True, "reason": "validation_service_disabled", "retryable": False, "next_stage": "resolve"}
                     )
 
                     project["plan_ir"] = plan_ir.model_dump()
@@ -186,10 +304,21 @@ class ProbeLoopService:
                     project["validation"] = validation
 
                     if validation["ok"]:
+                        project["retry_count"] = 0
                         project["status"] = "resolved"
                         project["stage"] = "resolve"
                         return {
                             "status": "resolved",
+                            "stage": "resolve",
+                            "resolution": resolution.model_dump(),
+                            "validation": validation,
+                        }
+
+                    if validation.get("next_stage") == "resolve":
+                        project["status"] = "needs_clarification"
+                        project["stage"] = "resolve"
+                        return {
+                            "status": "needs_clarification",
                             "stage": "resolve",
                             "resolution": resolution.model_dump(),
                             "validation": validation,
@@ -204,22 +333,31 @@ class ProbeLoopService:
                         "validation": validation,
                     }
 
+            if not any_action_executed:
                 validation = (
-                    self.validation_service.validate(project, plan_ir, result.model_dump())
+                    self.validation_service.validate(project, plan_ir, None)
                     if getattr(self, "validation_service", None)
-                    else {"ok": True, "reason": "validation_service_disabled", "retryable": False}
+                    else {"ok": False, "reason": "no_action_taken", "retryable": False, "next_stage": "replan"}
                 )
+                project["plan_ir"] = plan_ir.model_dump()
+                project["validation"] = validation
 
-                if not validation["ok"] and validation.get("retryable", False):
-                    project["plan_ir"] = plan_ir.model_dump()
-                    project["validation"] = validation
-                    project["status"] = "failed"
-                    project["stage"] = "replan"
+                if validation.get("next_stage") == "resolve":
+                    project["status"] = "needs_clarification"
+                    project["stage"] = "resolve"
                     return {
-                        "status": "failed",
-                        "stage": "replan",
+                        "status": "needs_clarification",
+                        "stage": "resolve",
                         "validation": validation,
                     }
+
+                project["status"] = "failed"
+                project["stage"] = "replan"
+                return {
+                    "status": "failed",
+                    "stage": "replan",
+                    "validation": validation,
+                }
 
         project["plan_ir"] = plan_ir.model_dump()
         project["status"] = "failed"

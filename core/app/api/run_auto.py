@@ -61,6 +61,7 @@ def run_auto(project_id: str, body: dict):
     plan_ir = _merge_project_state_into_plan(project)
     project["plan_ir"] = plan_ir.model_dump()
 
+    project["retry_count"] = 0
     project["status"] = "running"
     project["stage"] = "probe"
     router.project_store.save(project_id, project)
