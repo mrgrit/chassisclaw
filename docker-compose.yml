@@ -13,17 +13,25 @@ services:
     ports:
       - "${API_PORT:-8000}:8000"
 
-  subagent:
-    build: ./subagent
-    container_name: csclaw-subagent
+  subagent-1:
+    build: .
+    container_name: chassisclaw-subagent-1
+    command: ["python", "-m", "app.subagent"]
     environment:
-      AGENT_ID: local-agent-1
-      EVIDENCE_DIR: /data/evidence
-      MAX_OUTPUT_BYTES: "200000"
-    volumes:
-      - ./data:/data
-    ports:
-      - "${SUBAGENT_PORT:-55123}:55123"
+      CHASSISCLAW_AGENT_ID: local-agent-1
+      SUBAGENT_PORT: "55123"
+    expose:
+      - "55123"
+
+  subagent-2:
+    build: .
+    container_name: chassisclaw-subagent-2
+    command: ["python", "-m", "app.subagent"]
+    environment:
+      CHASSISCLAW_AGENT_ID: local-agent-2
+      SUBAGENT_PORT: "55123"
+    expose:
+      - "55123"
 
   engine:
     image: python:3.12-slim

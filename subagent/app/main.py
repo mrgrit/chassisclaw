@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+import os
 from app.api.run_script import router as run_script_router
 from app.api.capabilities import router as capabilities_router
 from app.services.runner import Runner
@@ -13,4 +14,8 @@ app.include_router(capabilities_router)
 
 @app.get("/health")
 def health():
-    return {"ok": True, "agent_id": "local-agent-1", "service": "chassisclaw-subagent"}
+    return {
+        "ok": True,
+        "agent_id": os.getenv("CHASSISCLAW_AGENT_ID", "bootstrap-agent"),
+        "service": "chassisclaw-subagent",
+    }

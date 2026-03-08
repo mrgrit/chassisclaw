@@ -2,6 +2,7 @@ import json
 import uuid
 import requests
 from pathlib import Path
+import textwrap
 
 
 class SkillRunner:
@@ -276,10 +277,56 @@ class SkillRunner:
         probes_ok = all(j.get("ok", False) for j in probe_results) if probe_results else False
 
         summary = self._build_onboarding_summary(project, job_results)
-        self._store_summary_artifact(project, summary)
 
         failure_summary = summary.get("failure_summary") or {}
         if failure_summary.get("has_failures"):
+            install_info = summary.get("install") or {}
+            execution_result = install_info.get("execution", {}) or {}
+
+            remediation_plan = self._build_remediation_plan(execution_result)
+            self._store_remediation_artifact(project, remediation_plan)
+            summary["artifacts"].append("install_remediation_plan.json")
+            summary["remediation_plan"] = remediation_plan
+
+            selected_strategy = self._get_resolved_answer(project, "bootstrap_strategy")
+            if selected_strategy:
+                remediation_actions = self._select_remediation_actions(remediation_plan, selected_strategy)
+                remediation_execution = self._execute_remediation_actions(remediation_actions)
+                self._store_remediation_execution_artifact(project, remediation_execution)
+
+                summary["artifacts"].append("install_remediation_execution.json")
+                summary["remediation_execution"] = remediation_execution
+
+                if remediation_execution.get("ok"):
+                    summary["next_actions"].append(
+                        f"Remediation actions executed successfully with strategy: {selected_strategy}."
+                    )
+                else:
+                    summary["blockers"].append("remediation_execution_failed")
+                    for item in remediation_execution.get("failure_summary", {}).get("items", []) or []:
+                        suggestion = item.get("suggested_next_action")
+                        if suggestion and suggestion not in summary["remediation_suggestions"]:
+                            summary["remediation_suggestions"].append(suggestion)
+        self._store_summary_artifact(project, summary)
+
+        failure_summary = summary.get("failure_summary") or {}
+        remediation_execution = summary.get("remediation_execution", {}) or {}
+
+        if failure_summary.get("has_failures"):
+            if remediation_execution and remediation_execution.get("ok"):
+                project["status"] = "planned"
+                project["stage"] = "report"
+                project["resolution"] = {}
+                self.project_store.save(project_id, project)
+                return {
+                    "ok": True,
+                    "project_id": project_id,
+                    "status": project["status"],
+                    "stage": project["stage"],
+                    "job_results": job_results,
+                    "summary": summary,
+                }
+
             transition = self._decide_failure_transition(failure_summary)
             project["status"] = transition["status"]
             project["stage"] = transition["stage"]
@@ -293,6 +340,7 @@ class SkillRunner:
                 "job_results": job_results,
                 "summary": summary,
                 "failure_transition": transition,
+                "remediation_plan": summary.get("remediation_plan"),
             }
 
         decision_job = next((j for j in job_results if j.get("type") == "decision"), None)
@@ -400,6 +448,10 @@ class SkillRunner:
             "remediation_suggestions": [],
             "bootstrap_targets": [],
             "post_install_health": [],
+            "successful_bootstrap_targets": [],
+            "failed_bootstrap_targets": [],
+            "remediation_plan": None,
+            "remediation_execution": None,
         }
 
         for job in probe_jobs:
@@ -458,9 +510,6 @@ class SkillRunner:
 
         summary["next_actions"].append("Proceed to detailed onboarding execution in later milestones.")
 
-        if summary.get("install") and summary["install"].get("mode") == "approved_install_plan":
-            summary["artifacts"].append("install_subagent_plan.json")
-
         install_info = summary.get("install") or {}
         plans = install_info.get("plans", []) or []
         execution = install_info.get("execution", {}) or {}
@@ -487,24 +536,36 @@ class SkillRunner:
                 summary["next_actions"].append("Review install_subagent_execution artifact and fix failing steps.")
 
             executed_targets = execution.get("executed_targets", []) or []
-        failed_health_rechecks = [
-            x.get("target_id")
-            for x in executed_targets
-            if not (x.get("health_recheck", {}) or {}).get("ok", False)
-        ]
-        if failed_health_rechecks:
-            summary["blockers"].append(
-                f"post_install_health_check_failed:{', '.join(failed_health_rechecks)}"
-            )
-            summary["remediation_suggestions"].append(
-                "Review install logs and verify the subagent process/service is running before retrying."
-            )
 
-        for x in executed_targets:
-            if x.get("health_recheck") is not None:
-                summary["post_install_health"].append(x["health_recheck"])
+            failed_health_rechecks = [
+                x.get("target_id")
+                for x in executed_targets
+                if not (x.get("health_recheck", {}) or {}).get("ok", False)
+            ]
+            if failed_health_rechecks:
+                summary["blockers"].append(
+                    f"post_install_health_check_failed:{', '.join(failed_health_rechecks)}"
+                )
+                summary["remediation_suggestions"].append(
+                    "Review install logs and verify the subagent process/service is running before retrying."
+                )
 
-        install_info = summary.get("install") or {}
+            for x in executed_targets:
+                if x.get("health_recheck") is not None:
+                    summary["post_install_health"].append(x["health_recheck"])
+
+            for item in executed_targets:
+                target_id = item.get("target_id")
+                if item.get("ok", False):
+                    summary["successful_bootstrap_targets"].append(target_id)
+                else:
+                    summary["failed_bootstrap_targets"].append(target_id)
+
+            if summary["failed_bootstrap_targets"]:
+                summary["next_actions"].append(
+                    f"Investigate failed bootstrap targets: {', '.join(summary['failed_bootstrap_targets'])}."
+                )
+
         for plan in install_info.get("plans", []) or []:
             summary["bootstrap_targets"].append({
                 "target_id": plan.get("target_id"),
@@ -512,6 +573,9 @@ class SkillRunner:
                 "health_check_url": plan.get("health_check_url"),
                 "bootstrap_mode": plan.get("bootstrap_mode"),
             })
+
+        #if summary.get("install") and summary["install"].get("mode") == "approved_install_plan":
+        #    summary["artifacts"].append("install_subagent_plan.json")
 
         return summary
 
@@ -739,81 +803,114 @@ class SkillRunner:
         else:
             install_pkg = "# TODO: detect/install prerequisites manually"
 
-        service_block = f"""{sudo_prefix}mkdir -p /opt/chassisclaw/subagent
-    cat > /tmp/chassisclaw-subagent-placeholder.py <<'PYEOF'
-    from http.server import BaseHTTPRequestHandler, HTTPServer
-    import json
-    import os
+        service_block = textwrap.dedent(f"""\
+            LOG_DIR=/var/log
+            RUN_DIR=/var/run
+            APP_DIR=/opt/chassisclaw/subagent
 
-    AGENT_ID = os.environ.get("CHASSISCLAW_AGENT_ID", "bootstrap-agent")
+            {sudo_prefix}mkdir -p "$APP_DIR"
+            {sudo_prefix}mkdir -p "$LOG_DIR"
 
-    class H(BaseHTTPRequestHandler):
-        def _send(self, obj, code=200):
-            body = json.dumps(obj).encode()
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            cat > /tmp/chassisclaw-subagent-placeholder.py <<'PYEOF'
+            from http.server import BaseHTTPRequestHandler, HTTPServer            
+            import json
+            import os
 
-        def do_GET(self):
-            if self.path == "/health":
-                self._send({{"ok": True, "agent_id": AGENT_ID, "service": "chassisclaw-subagent-bootstrap"}})
-                return
-            self._send({{"ok": False, "error": "not_found"}}, 404)
+            AGENT_ID = os.environ.get("CHASSISCLAW_AGENT_ID", "bootstrap-agent")
 
-    HTTPServer(("0.0.0.0", 55123), H).serve_forever()
-    PYEOF
+            class H(BaseHTTPRequestHandler):
+                def _send(self, obj, code=200):
+                    body = json.dumps(obj).encode()
+                    self.send_response(code)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
 
-    {sudo_prefix}cp /tmp/chassisclaw-subagent-placeholder.py /opt/chassisclaw/subagent/subagent.py
-    """
+                def log_message(self, format, *args):
+                    return
 
-        systemd_block = f"""if command -v systemctl >/dev/null 2>&1; then
-    cat > /tmp/chassisclaw-subagent.service <<'EOF'
-    [Unit]
-    Description=ChassisClaw SubAgent Placeholder
-    After=network.target
+                def do_GET(self):
+                    if self.path == "/health":
+                        self._send({{"ok": True, "agent_id": AGENT_ID, "service": "chassisclaw-subagent-bootstrap"}})
+                        return
+                    self._send({{"ok": False, "error": "not_found"}}, 404)
 
-    [Service]
-    Environment=CHASSISCLAW_AGENT_ID=$(hostname)
-    ExecStart=/usr/bin/python3 /opt/chassisclaw/subagent/subagent.py
-    Restart=always
-    RestartSec=3
+            HTTPServer(("0.0.0.0", 55123), H).serve_forever()
+            PYEOF
 
-    [Install]
-    WantedBy=multi-user.target
-    EOF
+            {sudo_prefix}cp /tmp/chassisclaw-subagent-placeholder.py "$APP_DIR/subagent.py"
+        """)
 
-    {sudo_prefix}cp /tmp/chassisclaw-subagent.service /etc/systemd/system/chassisclaw-subagent.service
-    {sudo_prefix}systemctl daemon-reload
-    {sudo_prefix}systemctl enable --now chassisclaw-subagent.service
-    else
-    nohup python3 /opt/chassisclaw/subagent/subagent.py >/tmp/chassisclaw-subagent.out 2>/tmp/chassisclaw-subagent.err &
-    fi
-    """
+        systemd_block = textwrap.dedent(f"""\
+            if command -v systemctl >/dev/null 2>&1; then
+            cat > /tmp/chassisclaw-subagent.service <<'EOF'
+            [Unit]
+            Description=ChassisClaw SubAgent Placeholder
+            After=network.target
 
-        verify_block = """sleep 2
-    curl -fsS http://127.0.0.1:55123/health || true
-    """
+            [Service]
+            Environment=CHASSISCLAW_AGENT_ID=%H
+            ExecStart=/usr/bin/python3 /opt/chassisclaw/subagent/subagent.py
+            Restart=always
+            RestartSec=3
+            StandardOutput=append:/var/log/chassisclaw-subagent.log
+            StandardError=append:/var/log/chassisclaw-subagent.err
 
-        script = f"""#!/usr/bin/env bash
-    set -euo pipefail
+            [Install]
+            WantedBy=multi-user.target
+            EOF
 
-    echo "[1/5] install prerequisites"
-    {install_pkg}
+            {sudo_prefix}cp /tmp/chassisclaw-subagent.service /etc/systemd/system/chassisclaw-subagent.service
+            {sudo_prefix}systemctl daemon-reload
+            {sudo_prefix}systemctl enable --now chassisclaw-subagent.service
+            else
+            nohup python3 /opt/chassisclaw/subagent/subagent.py >/var/log/chassisclaw-subagent.log 2>/var/log/chassisclaw-subagent.err &
+            echo $! >/tmp/chassisclaw-subagent.pid
+            fi
+        """)
 
-    echo "[2/5] verify python"
-    python3 --version || true
+        verify_block = textwrap.dedent("""\
+            HEALTH_OK=0
+            for i in 1 2 3 4 5; do
+            if curl -fsS http://127.0.0.1:55123/health >/tmp/chassisclaw-health.json 2>/tmp/chassisclaw-health.err; then
+                HEALTH_OK=1
+                break
+            fi
+            sleep 2
+            done
 
-    echo "[3/5] place placeholder subagent"
-    {service_block}
+            if [ "$HEALTH_OK" -ne 1 ]; then
+            echo "[health-check] failed after retries" >&2
+            echo "--- tail log ---" >&2
+            tail -n 50 /var/log/chassisclaw-subagent.log 2>/dev/null || true
+            echo "--- tail err ---" >&2
+            tail -n 50 /var/log/chassisclaw-subagent.err 2>/dev/null || true
+            exit 1
+            fi
 
-    echo "[4/5] start service or background process"
-    {systemd_block}
+            cat /tmp/chassisclaw-health.json || true
+        """)
 
-    echo "[5/5] verify local health"
-    {verify_block}
-    """
+        script = textwrap.dedent(f"""\
+            #!/usr/bin/env bash
+            set -euo pipefail
+
+            echo "[1/5] install prerequisites"
+            {install_pkg}
+
+            echo "[2/5] verify python"
+            python3 --version || true
+
+            echo "[3/5] place placeholder subagent"
+            {service_block}            
+
+            echo "[4/5] start service or background process"
+            {systemd_block}
+
+            echo "[5/5] verify local health with retry"
+            {verify_block}
+        """)
         return script
 
     def _store_install_artifact(self, project: dict, install_result: dict) -> None:
@@ -855,6 +952,7 @@ class SkillRunner:
                     "ok": False,
                     "error": "target_not_found",
                     "results": [],
+                    "health_recheck": None,
                 })
                 continue
 
@@ -873,13 +971,19 @@ class SkillRunner:
                 item = result.model_dump() if hasattr(result, "model_dump") else result
                 classification = self._classify_execution_failure(item)
 
+                stdout_text = item.get("stdout", "") or ""
+                stderr_text = item.get("stderr", "") or ""
+
                 action_results.append({
                     "action_id": action.get("id"),
                     "result": item,
                     "classification": classification,
+                    "stdout_tail": stdout_text[-1000:],
+                    "stderr_tail": stderr_text[-1000:],
                 })
 
-                exit_code = item.get("exit_code", 1)
+                exit_code_raw = item.get("exit_code", 1)
+                exit_code = 1 if exit_code_raw is None else int(exit_code_raw)
                 if exit_code != 0:
                     all_ok = False
 
@@ -904,11 +1008,31 @@ class SkillRunner:
 
     def _store_install_execution_artifact(self, project: dict, execution_result: dict) -> None:
         artifacts = project.get("artifacts", []) or []
+
+        success_targets = []
+        failed_targets = []
+
+        for item in execution_result.get("executed_targets", []) or []:
+            target_id = item.get("target_id")
+            if item.get("ok", False):
+                success_targets.append(target_id)
+            else:
+                failed_targets.append(target_id)
+
+        artifact_payload = {
+            "mode": execution_result.get("mode"),
+            "ok": execution_result.get("ok", False),
+            "success_targets": success_targets,
+            "failed_targets": failed_targets,
+            "failure_summary": execution_result.get("failure_summary", {}),
+            "executed_targets": execution_result.get("executed_targets", []),
+        }
+
         artifacts = [a for a in artifacts if a.get("type") != "install_subagent_execution"]
         artifacts.append({
             "type": "install_subagent_execution",
             "name": "install_subagent_execution.json",
-            "data": execution_result,
+            "data": artifact_payload,
         })
         project["artifacts"] = artifacts
 
@@ -1106,4 +1230,184 @@ class SkillRunner:
                 "ok": False,
                 "error": str(e),
             }
+
+    def _build_remediation_plan(self, execution_result: dict) -> dict:
+        failure_summary = execution_result.get("failure_summary", {}) or {}
+        items = failure_summary.get("items", []) or []
+
+        plans = []
+
+        for item in items:
+            target_id = item.get("target_id")
+            failure_type = item.get("failure_type")
+
+            if failure_type == "command_not_found":
+                plans.append({
+                    "target_id": target_id,
+                    "failure_type": failure_type,
+                    "strategy": "install_missing_tools",
+                    "actions": [
+                        {
+                            "id": f"probe_missing_tool_{target_id}",
+                            "type": "shell",
+                            "target_id": target_id,
+                            "timeout_s": 60,
+                            "script": "command -v python3 || true\ncommand -v curl || true\ncommand -v apt-get || command -v dnf || command -v yum || command -v apk || true\n",
+                        }
+                    ],
+                })
+
+            elif failure_type == "permission_denied":
+                plans.append({
+                    "target_id": target_id,
+                    "failure_type": failure_type,
+                    "strategy": "request_elevated_execution",
+                    "actions": [],
+                })
+
+            elif failure_type == "timeout":
+                plans.append({
+                    "target_id": target_id,
+                    "failure_type": failure_type,
+                    "strategy": "retry_with_longer_timeout",
+                    "actions": [
+                        {
+                            "id": f"retry_install_{target_id}",
+                            "type": "shell",
+                            "target_id": target_id,
+                            "timeout_s": 600,
+                            "script": "echo 'TODO: rerun install with longer timeout'\n",
+                        }
+                    ],
+                })
+
+            elif failure_type == "network_unreachable":
+                plans.append({
+                    "target_id": target_id,
+                    "failure_type": failure_type,
+                    "strategy": "connectivity_probe",
+                    "actions": [
+                        {
+                            "id": f"probe_connectivity_{target_id}",
+                            "type": "shell",
+                            "target_id": target_id,
+                            "timeout_s": 60,
+                            "script": "getent hosts localhost || true\nip route || true\n",
+                        }
+                    ],
+                })
+
+            else:
+                plans.append({
+                    "target_id": target_id,
+                    "failure_type": failure_type,
+                    "strategy": "manual_review",
+                    "actions": [],
+                })
+
+        return {
+            "ok": True,
+            "plans": plans,
+        }
+
+    def _store_remediation_artifact(self, project: dict, remediation_plan: dict) -> None:
+        artifacts = project.get("artifacts", []) or []
+        artifacts = [a for a in artifacts if a.get("type") != "install_remediation_plan"]
+        artifacts.append({
+            "type": "install_remediation_plan",
+            "name": "install_remediation_plan.json",
+            "data": remediation_plan,
+        })
+        project["artifacts"] = artifacts
+
+    def _get_resolved_answer(self, project: dict, field: str):
+        answers = project.get("answers", {}) or {}
+        if field in answers:
+            return answers.get(field)
+
+        resolution = project.get("resolution", {}) or {}
+        resolved_inputs = resolution.get("resolved_inputs", {}) or {}
+        return resolved_inputs.get(field)
+
+    def _select_remediation_actions(self, remediation_plan: dict, selected_strategy: str | None) -> list[dict]:
+        if not remediation_plan:
+            return []
+
+        plans = remediation_plan.get("plans", []) or []
+        selected_actions = []
+
+        for plan in plans:
+            strategy = plan.get("strategy")
+            if selected_strategy and strategy != selected_strategy:
+                continue
+
+            for action in plan.get("actions", []) or []:
+                selected_actions.append(action)
+
+        return selected_actions
+
+    def _execute_remediation_actions(self, actions: list[dict]) -> dict:
+        if not actions:
+            return {
+                "ok": False,
+                "mode": "remediation_executed",
+                "executed_actions": [],
+                "failure_summary": {
+                    "has_failures": True,
+                    "failure_types": ["no_actions_selected"],
+                    "items": [{
+                        "failure_type": "no_actions_selected",
+                        "reason": "No remediation actions were selected for execution.",
+                        "suggested_next_action": "Choose a remediation strategy and regenerate or rerun the remediation plan.",
+                    }],
+                },
+            }
+
+        executed_actions = []
+        failure_items = []
+
+        for action in actions:
+            result = self._execute_shell_action(action)
+            ok = bool(result.get("ok", False))
+
+            executed_actions.append({
+                "action_id": action.get("id"),
+                "target_id": action.get("target_id"),
+                "ok": ok,
+                "result": result,
+            })
+
+            if not ok:
+                failure_items.append({
+                    "target_id": action.get("target_id"),
+                    "action_id": action.get("id"),
+                    "failure_type": "remediation_action_failed",
+                    "reason": result.get("stderr") or result.get("error") or "Remediation action failed.",
+                    "suggested_next_action": "Inspect stderr/stdout and adjust remediation strategy.",
+                })
+
+        return {
+            "ok": len(failure_items) == 0,
+            "mode": "remediation_executed",
+            "executed_actions": executed_actions,
+            "failure_summary": {
+                "has_failures": len(failure_items) > 0,
+                "failure_types": sorted(list({x["failure_type"] for x in failure_items})),
+                "items": failure_items,
+            },
+        }
+
+    def _store_remediation_execution_artifact(self, project: dict, execution_result: dict) -> None:
+        artifacts = project.get("artifacts", []) or []
+        artifacts = [a for a in artifacts if a.get("name") != "install_remediation_execution.json"]
+        artifacts.append({
+            "type": "install_remediation_execution",
+            "name": "install_remediation_execution.json",
+            "data": execution_result,
+        })
+        project["artifacts"] = artifacts
+
+    
+
+    
     
