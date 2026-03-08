@@ -55,3 +55,26 @@ def execute_skill_stub(skill_id: str, body: dict = Body(...)):
             raise HTTPException(status_code=404, detail=result)
         raise HTTPException(status_code=400, detail=result)
     return result
+
+@router.post("/skills/{skill_id}/approve_stub")
+def approve_skill_stub(skill_id: str, body: dict = Body(...)):
+    project_id = body.get("project_id")
+    approved = body.get("approved")
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id is required")
+    if approved is None:
+        raise HTTPException(status_code=400, detail="approved is required")
+
+    result = router.skill_runner.approve_stub(
+        project_id=project_id,
+        skill_id=skill_id,
+        approved=bool(approved),
+    )
+
+    if not result.get("ok"):
+        error = result.get("error")
+        if error in ("project_not_found", "selected_skill_mismatch"):
+            raise HTTPException(status_code=404, detail=result)
+        raise HTTPException(status_code=400, detail=result)
+
+    return result

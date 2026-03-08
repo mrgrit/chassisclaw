@@ -25,6 +25,11 @@
       "description": "Determine whether subagent installation is required and approved"
     },
     {
+      "id": "install_subagent",
+      "type": "install",
+      "description": "Install or prepare subagent bootstrap on targets that require approval"
+    },
+    {
       "id": "report_summary",
       "type": "report",
       "description": "Summarize onboarding readiness, blockers, and next actions"
@@ -33,6 +38,7 @@
   "expected_artifacts": [
     "node_a_probe_result.json",
     "node_b_probe_result.json",
+    "install_subagent_plan.json",
     "onboarding_summary.json"
   ]
 }

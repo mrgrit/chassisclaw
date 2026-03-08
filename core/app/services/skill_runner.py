@@ -212,6 +212,20 @@ class SkillRunner:
                 })
                 continue
 
+            if job_type == "install":
+                decision_job = next((j for j in job_results if j.get("type") == "decision"), None)
+                decision_result = decision_job.get("result", {}) if decision_job else {}
+                approved = bool((project.get("approvals", {}) or {}).get("install_subagent", False))
+
+                install_result = self._build_install_stub_result(decision_result, approved)
+                job_results.append({
+                    "job_id": job_id,
+                    "type": job_type,
+                    "ok": install_result.get("ok", False),
+                    "result": install_result,
+                })
+                continue
+
             if job_type == "report":
                 job_results.append({
                     "job_id": job_id,
@@ -248,21 +262,26 @@ class SkillRunner:
             project["resolution"] = {}
 
             if overall_decision == "approval_needed":
-                project["status"] = "needs_approval"
-                project["stage"] = "resolve"
-                project["resolution"] = {
-                    "mode": "APPROVAL",
-                    "resolved_inputs": {},
-                    "question": None,
-                    "approval_request": {
-                        "field": "install_subagent",
-                        "text": f"다음 타겟에 subagent/bootstrap 설치 승인이 필요함: {', '.join(decision_result.get('needs_approval_targets', []))}",
-                        "risk": "high",
-                    },
-                    "rationale": "Decision stub determined that installation approval is required.",
-                    "evidence_map": {},
-                    "evidence_refs": [],
-                }
+                approved = bool((project.get("approvals", {}) or {}).get("install_subagent", False))
+                if approved:
+                    project["status"] = "planned"
+                    project["stage"] = "report"
+                else:
+                    project["status"] = "needs_approval"
+                    project["stage"] = "resolve"
+                    project["resolution"] = {
+                        "mode": "APPROVAL",
+                        "resolved_inputs": {},
+                        "question": None,
+                        "approval_request": {
+                            "field": "install_subagent",
+                            "text": f"다음 타겟에 subagent/bootstrap 설치 승인이 필요함: {', '.join(decision_result.get('needs_approval_targets', []))}",
+                            "risk": "high",
+                        },
+                        "rationale": "Decision stub determined that installation approval is required.",
+                        "evidence_map": {},
+                        "evidence_refs": [],
+                    }
             else:
                 project["status"] = "planned"
                 project["stage"] = "report"
@@ -288,6 +307,7 @@ class SkillRunner:
         precheck = next((j for j in job_results if j.get("type") == "precheck"), None)
         probe_jobs = [j for j in job_results if j.get("type") == "probe"]
         decision_job = next((j for j in job_results if j.get("type") == "decision"), None)
+        install_job = next((j for j in job_results if j.get("type") == "install"), None)
 
         summary = {
             "project_id": project["id"],
@@ -295,6 +315,7 @@ class SkillRunner:
             "precheck_ok": bool(precheck and precheck.get("ok")),
             "targets": [],
             "decision": decision_job.get("result") if decision_job else None,
+            "install": install_job.get("result") if install_job else None,
             "overall_status": "unknown",
             "blockers": [],
             "next_actions": [],
@@ -326,12 +347,19 @@ class SkillRunner:
         decision = summary.get("decision") or {}
         overall_decision = decision.get("overall_decision")
 
+        install_result = summary.get("install") or {}
+        install_mode = install_result.get("mode")
+
         if overall_decision == "manual_action_needed":
             summary["overall_status"] = "manual_action_needed"
             summary["next_actions"].append("Prepare manual bootstrap path for targets lacking installation prerequisites.")
         elif overall_decision == "approval_needed":
-            summary["overall_status"] = "approval_needed"
-            summary["next_actions"].append("Request approval for subagent/bootstrap installation on required targets.")
+            if install_mode == "approved_install_plan":
+                summary["overall_status"] = "install_planned"
+                summary["next_actions"].append("Installation stub plan created after approval.")
+            else:
+                summary["overall_status"] = "approval_needed"
+                summary["next_actions"].append("Request approval for subagent/bootstrap installation on required targets.")
         else:
             summary["overall_status"] = "ready"
             summary["next_actions"].append("No installation blocker detected for currently reachable targets.")
@@ -364,7 +392,7 @@ class SkillRunner:
         package_manager = capabilities_body.get("package_manager")
         python_value = capabilities_body.get("python")
         sudo_value = capabilities_body.get("sudo")
-
+                
         if health_ok:
             return {
                 "target_id": target_id,
@@ -373,7 +401,7 @@ class SkillRunner:
                 "reason": "Subagent health endpoint already responds successfully.",
                 "recommended_next_action": "Skip installation and continue onboarding.",
             }
-
+        
         if package_manager and python_value:
             return {
                 "target_id": target_id,
@@ -422,4 +450,77 @@ class SkillRunner:
             "needs_approval_targets": needs_approval_targets,
             "manual_bootstrap_targets": manual_targets,
             "per_target": per_target,
+        }
+
+    def _build_install_stub_result(self, decision_result: dict, approved: bool) -> dict:
+        needs_targets = decision_result.get("needs_approval_targets", []) or []
+        manual_targets = decision_result.get("manual_bootstrap_targets", []) or []
+
+        if not needs_targets and not manual_targets:
+            return {
+                "ok": True,
+                "mode": "skip",
+                "reason": "No installation-required targets detected.",
+                "targets": [],
+            }
+
+        if not approved:
+            return {
+                "ok": False,
+                "mode": "blocked",
+                "reason": "Approval not granted for install_subagent.",
+                "targets": needs_targets + manual_targets,
+            }
+
+        plans = []
+        for target_id in needs_targets:
+            plans.append({
+                "target_id": target_id,
+                "action": "prepare_install_stub",
+                "status": "planned",
+                "reason": "Approval granted; installation stub can proceed in later milestones.",
+            })
+
+        for target_id in manual_targets:
+            plans.append({
+                "target_id": target_id,
+                "action": "manual_bootstrap_required",
+                "status": "blocked_manual",
+                "reason": "Approval granted but prerequisites are insufficient for automatic install.",
+            })
+
+        return {
+            "ok": True,
+            "mode": "approved_install_plan",
+            "targets": needs_targets + manual_targets,
+            "plans": plans,
+        }
+
+    def approve_stub(self, project_id: str, skill_id: str, approved: bool) -> dict:
+        project = self.project_store.get(project_id)
+        if not project:
+            return {"ok": False, "error": "project_not_found"}
+
+        if project.get("selected_skill") != skill_id:
+            return {"ok": False, "error": "selected_skill_mismatch"}
+
+        approvals = project.get("approvals", {}) or {}
+        approvals["install_subagent"] = approved
+        project["approvals"] = approvals
+
+        if approved:
+            project["status"] = "planned"
+            project["stage"] = "execute"
+            project["resolution"] = {}
+        else:
+            project["status"] = "needs_clarification"
+            project["stage"] = "resolve"
+
+        self.project_store.save(project_id, project)
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "approved": approved,
+            "status": project["status"],
+            "stage": project["stage"],
         }
