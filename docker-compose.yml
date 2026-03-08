@@ -6,6 +6,8 @@ services:
       DATA_ROOT: /data
     volumes:
       - ./data:/data
+      - ./core:/app
+      - ./skills:/app/skills
     depends_on:
       - subagent
     ports:

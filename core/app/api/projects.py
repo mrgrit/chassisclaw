@@ -16,7 +16,16 @@ def create_project(req: CreateProjectReq):
         "target_ids": req.target_ids,
         "answers": {},
         "approvals": {},
-        "plan_ir": {"goal": req.request_text, "unknowns": ["iface_in", "iface_out"]},
+        "plan_ir": {
+            "goal": req.request_text,
+            "unknowns": [],
+            "inputs": {},
+            "input_rationales": {},
+            "evidence_map": {},
+            "answers": {},
+            "approvals": {},
+            "plan": {"jobs": [], "steps": []}
+        },
         "resolution": {},
         "artifacts": [],
     }

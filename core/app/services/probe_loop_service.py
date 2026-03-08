@@ -375,95 +375,107 @@ class ProbeLoopService:
                 evidence_map=dict(plan_ir.evidence_map or {}),
             )
 
-        if "iface_in" in unknowns and "iface_in" not in known_inputs:
-            return ActionIR(actions=[{
-                "id": "probe_iface",
-                "type": "shell",
-                "target_id": project["target_ids"][0],
-                "timeout_s": 20,
-                "script": "ip -o link show\nip route\n",
-            }])
-
-        if "iface_out" in unknowns and "iface_out" not in known_inputs:
-            iface_in = known_inputs.get("iface_in", "")
-            return ActionIR(actions=[{
-                "id": "probe_iface_out",
-                "type": "shell",
-                "target_id": project["target_ids"][0],
-                "timeout_s": 20,
-                "script": f"ip -o link show\nip route\nprintf '\\nKNOWN_IFACE_IN={iface_in}\\n'\n",
-            }])
-
-        return ActionIR()
+        return ActionIR(actions=[{
+            "id": "probe_network_facts",
+            "type": "shell",
+            "target_id": project["target_ids"][0],
+            "timeout_s": 20,
+            "script": "ifconfig -a || true\nroute -n || true\ncat /proc/net/dev\n",
+        }])
 
     def _ask_master_after_probe(self, llm_conn: dict, plan_ir: PlaybookIR, result: dict, project: dict, ev_ref: str) -> ActionIR:
         stdout = result.get("stdout", "") or ""
-        known_inputs = plan_ir.inputs or {}
-        unknowns = set(plan_ir.unknowns)
-    
-        # 1) iface_in 미해결 상태면 iface_in부터 판단
-        if "iface_in" in unknowns and "iface_in" not in known_inputs:
-            if "ens33" in stdout:
-                return ActionIR(
-                    resolved_inputs={"iface_in": "ens33"},
-                    input_rationales={"iface_in": "Probe output contains interface ens33"},
-                    evidence_map={"iface_in": [ev_ref]},
-                )
+        obs = self._parse_probe_output(stdout)
+        return self._decide_from_probe_observation(plan_ir, obs, ev_ref)
 
-            if "eth0" in stdout:
-                return ActionIR(
-                    resolved_inputs={"iface_in": "eth0"},
-                    input_rationales={"iface_in": "Probe output contains interface eth0"},
-                    evidence_map={"iface_in": [ev_ref]},
-                )
+def _parse_probe_output(self, stdout: str) -> dict:
+    interfaces = []
+    routes = []
 
-            return ActionIR(question={
-                "type": "fact",
-                "field": "iface_in",
-                "text": "내부망 인터페이스 선택해줘",
-                "choices": [],
-            })
+    for line in (stdout or "").splitlines():
+        s = line.strip()
+        if not s:
+            continue
 
-        # 2) iface_in 은 이미 있고 iface_out 미해결이면 iface_out 판단
-        if "iface_out" in unknowns and "iface_out" not in known_inputs:
-            iface_in = known_inputs.get("iface_in")
+        if ": " in s and not s.startswith(("default", "10.", "172.", "192.168.", "169.254.")):
+            try:
+                name = s.split(": ", 1)[1].split("@", 1)[0].strip()
+                if name and name != "lo" and name not in interfaces:
+                    interfaces.append(name)
+            except Exception:
+                pass
 
-            candidates = []
-            for line in stdout.splitlines():
-                line = line.strip()
-                if not line or ": lo:" in line:
-                    continue
-                if ": " in line:
-                    name = line.split(": ", 1)[1].split("@", 1)[0].strip()
-                    if name and name != iface_in and name != "lo":
-                        candidates.append(name)
+        if s.startswith("default ") or " via " in s or " dev " in s:
+            routes.append(s)
 
-            candidates = list(dict.fromkeys(candidates))
+    return {
+        "interfaces": interfaces,
+        "routes": routes,
+    }
 
-            if len(candidates) == 1:
-                return ActionIR(
-                    resolved_inputs={"iface_out": candidates[0]},
-                    input_rationales={"iface_out": f"Selected remaining interface except iface_in={iface_in}"},
-                    evidence_map={"iface_out": [ev_ref]},
-                )
+def _decide_from_probe_observation(self, plan_ir: PlaybookIR, obs: dict, ev_ref: str) -> ActionIR:
+    unknowns = set(plan_ir.unknowns)
+    known = plan_ir.inputs or {}
 
-            if len(candidates) >= 2:
-                return ActionIR(question={
+    interfaces = obs.get("interfaces", []) or []
+
+    if not unknowns:
+        return ActionIR(
+            resolved_inputs=dict(known),
+            input_rationales=dict(plan_ir.input_rationales or {}),
+            evidence_map=dict(plan_ir.evidence_map or {}),
+            probe_observation=obs,
+        )
+
+    if "iface_in" in unknowns and "iface_in" not in known:
+        if len(interfaces) == 1:
+            return ActionIR(
+                resolved_inputs={"iface_in": interfaces[0]},
+                input_rationales={"iface_in": "Only one non-loopback interface detected from probe output"},
+                evidence_map={"iface_in": [ev_ref]},
+                probe_observation=obs,
+            )
+
+        if len(interfaces) >= 2:
+            return ActionIR(
+                question={
+                    "type": "fact",
+                    "field": "iface_in",
+                    "text": "내부망 인터페이스 선택해줘",
+                    "choices": [{"value": x, "label": x} for x in interfaces],
+                },
+                probe_observation=obs,
+            )
+
+    if "iface_out" in unknowns and "iface_out" not in known:
+        iface_in = known.get("iface_in")
+        candidates = [x for x in interfaces if x != iface_in]
+
+        if len(candidates) == 1:
+            return ActionIR(
+                resolved_inputs={"iface_out": candidates[0]},
+                input_rationales={"iface_out": f"Selected remaining interface excluding iface_in={iface_in}"},
+                evidence_map={"iface_out": [ev_ref]},
+                probe_observation=obs,
+            )
+
+        if len(candidates) >= 2:
+            return ActionIR(
+                question={
                     "type": "fact",
                     "field": "iface_out",
                     "text": f"외부망 인터페이스 선택해줘 (iface_in={iface_in} 제외)",
-                    "choices": [{"value": c, "label": c} for c in candidates],
-                })
+                    "choices": [{"value": x, "label": x} for x in candidates],
+                },
+                probe_observation=obs,
+            )
 
-            return ActionIR(question={
-                "type": "fact",
-                "field": "iface_out",
-                "text": "외부망 인터페이스 선택해줘",
-                "choices": [],
-            })
-
-        return ActionIR(
-            resolved_inputs={},
-            input_rationales={},
-            evidence_map={},
-        )
+    return ActionIR(
+        question={
+            "type": "fact",
+            "field": list(unknowns)[0] if unknowns else "unknown",
+            "text": "추가 입력이 필요해",
+            "choices": [],
+        },
+        probe_observation=obs,
+    )

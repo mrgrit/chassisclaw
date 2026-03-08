@@ -27,7 +27,7 @@ class PlaybookIR(BaseModel):
     # 이후 확장 대비
     candidate_playbooks: list[str] = Field(default_factory=list)
     plan: dict[str, Any] = Field(default_factory=lambda: {"jobs": [], "steps": []})
-    validate: list[dict[str, Any]] = Field(default_factory=list)
+    validation_rules: list[dict[str, Any]] = Field(default_factory=list)
     errors: list[dict[str, Any]] = Field(default_factory=list)
     fixes: list[dict[str, Any]] = Field(default_factory=list)
     replans: list[dict[str, Any]] = Field(default_factory=list)

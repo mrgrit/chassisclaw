@@ -1,0 +1,38 @@
+{
+  "id": "ops.onboard.two_node",
+  "name": "Two Node Onboarding",
+  "version": "0.1.0",
+  "category": "operations",
+  "description": "Onboard two target nodes by checking reachability, probing capabilities, and preparing agent deployment prerequisites.",
+  "kind": "skill",
+  "required_inputs": [
+    "node_a_target_id",
+    "node_b_target_id"
+  ],
+  "optional_inputs": [
+    "ssh_username",
+    "ssh_port",
+    "install_subagent",
+    "package_manager_hint",
+    "internal_cidr"
+  ],
+  "outputs": [
+    "node_a_capabilities",
+    "node_b_capabilities",
+    "node_a_health",
+    "node_b_health",
+    "onboarding_summary"
+  ],
+  "validation": {
+    "success_conditions": [
+      "both_targets_exist",
+      "both_targets_reachable_or_reason_captured",
+      "capabilities_collected_or_reason_captured"
+    ],
+    "failure_conditions": [
+      "target_missing",
+      "all_probes_failed",
+      "subagent_install_requested_but_not_approved"
+    ]
+  }
+}

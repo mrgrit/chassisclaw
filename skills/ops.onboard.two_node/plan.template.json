@@ -1,0 +1,38 @@
+{
+  "skill_id": "ops.onboard.two_node",
+  "goal": "Onboard two nodes into ChassisClaw management scope",
+  "jobs": [
+    {
+      "id": "check_targets_exist",
+      "type": "precheck",
+      "description": "Verify both targets are registered"
+    },
+    {
+      "id": "probe_node_a",
+      "type": "probe",
+      "target_input": "node_a_target_id",
+      "description": "Collect health and capability facts from node A"
+    },
+    {
+      "id": "probe_node_b",
+      "type": "probe",
+      "target_input": "node_b_target_id",
+      "description": "Collect health and capability facts from node B"
+    },
+    {
+      "id": "decide_subagent_install",
+      "type": "decision",
+      "description": "Determine whether subagent installation is required and approved"
+    },
+    {
+      "id": "report_summary",
+      "type": "report",
+      "description": "Summarize onboarding readiness, blockers, and next actions"
+    }
+  ],
+  "expected_artifacts": [
+    "node_a_probe_result.json",
+    "node_b_probe_result.json",
+    "onboarding_summary.json"
+  ]
+}

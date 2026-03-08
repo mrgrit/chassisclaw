@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ops.onboard.two_node inputs",
+  "type": "object",
+  "required": [
+    "node_a_target_id",
+    "node_b_target_id"
+  ],
+  "properties": {
+    "node_a_target_id": {
+      "type": "string",
+      "description": "First target identifier"
+    },
+    "node_b_target_id": {
+      "type": "string",
+      "description": "Second target identifier"
+    },
+    "ssh_username": {
+      "type": "string"
+    },
+    "ssh_port": {
+      "type": "integer",
+      "default": 22
+    },
+    "install_subagent": {
+      "type": "boolean",
+      "default": false
+    },
+    "package_manager_hint": {
+      "type": "string",
+      "enum": ["apt", "dnf", "yum", "apk", "unknown"]
+    },
+    "internal_cidr": {
+      "type": "string"
+    }
+  }
+}

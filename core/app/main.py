@@ -18,6 +18,10 @@ from app.services.validation_service import ValidationService
 from app.storage.project_store import ProjectStore
 from app.storage.target_store import TargetStore
 
+from app.api.skills import router as skills_router
+from app.services.skill_registry import SkillRegistry
+from app.services.skill_runner import SkillRunner
+
 app = FastAPI(title="ChassisClaw Core")
 
 project_store = ProjectStore()
@@ -27,6 +31,15 @@ evidence_service = EvidenceService()
 llm_registry = LLMRegistry()
 subagent_client = SubAgentClient()
 validation_service = ValidationService()
+
+skill_registry = SkillRegistry()
+skills_router.skill_registry = skill_registry
+skill_runner = SkillRunner(
+    skill_registry=skill_registry,
+    project_store=project_store,
+    target_store=target_store,
+)
+skills_router.skill_runner = skill_runner
 
 probe_loop_service = ProbeLoopService(
     llm_registry=llm_registry,
@@ -54,3 +67,4 @@ app.include_router(answers_router)
 app.include_router(approvals_router)
 app.include_router(llm_router)
 app.include_router(run_auto_router)
+app.include_router(skills_router)

@@ -40,5 +40,7 @@ class ActionIR(BaseModel):
     input_rationales: dict[str, str] = Field(default_factory=dict)
     evidence_map: dict[str, list[str]] = Field(default_factory=dict)
 
-    question: Optional[HumanQuestion] = None
+    question: Optional[HumanQuestion] = None    
     approval_request: Optional[ApprovalRequest] = None
+    # 메타 추가
+    probe_observation: dict[str, Any] = Field(default_factory=dict)
