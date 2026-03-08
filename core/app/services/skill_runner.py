@@ -1,13 +1,15 @@
 import json
+import uuid
 import requests
 from pathlib import Path
 
 
 class SkillRunner:
-    def __init__(self, skill_registry, project_store, target_store):
+    def __init__(self, skill_registry, project_store, target_store, subagent_client):
         self.skill_registry = skill_registry
         self.project_store = project_store
         self.target_store = target_store
+        self.subagent_client = subagent_client
 
     def _load_inputs_schema(self, skill_id: str) -> dict | None:
         skill_dir = Path("skills") / skill_id
@@ -69,6 +71,9 @@ class SkillRunner:
         ) or bool(
             out["capabilities"] and out["capabilities"]["status_code"] < 500
         )
+        identity = self._check_target_identity(target["id"], out)
+        out["identity"] = identity
+
         return out
 
     def run_stub(self, project_id: str, skill_id: str, inputs: dict) -> dict:
@@ -218,12 +223,31 @@ class SkillRunner:
                 approved = bool((project.get("approvals", {}) or {}).get("install_subagent", False))
 
                 install_result = self._build_install_stub_result(decision_result, approved)
-                job_results.append({
-                    "job_id": job_id,
-                    "type": job_type,
-                    "ok": install_result.get("ok", False),
-                    "result": install_result,
-                })
+
+                if install_result.get("mode") == "approved_install_plan":
+                    self._store_install_artifact(project, install_result)
+
+                    execution_result = self._execute_install_actions(install_result.get("plans", []))
+                    self._store_install_execution_artifact(project, execution_result)
+
+                    merged_result = {
+                        **install_result,
+                        "execution": execution_result,
+                    }
+
+                    job_results.append({
+                        "job_id": job_id,
+                        "type": job_type,
+                        "ok": execution_result.get("ok", False),
+                        "result": merged_result,
+                    })
+                else:
+                    job_results.append({
+                        "job_id": job_id,
+                        "type": job_type,
+                        "ok": install_result.get("ok", False),
+                        "result": install_result,
+                    })
                 continue
 
             if job_type == "report":
@@ -254,9 +278,58 @@ class SkillRunner:
         summary = self._build_onboarding_summary(project, job_results)
         self._store_summary_artifact(project, summary)
 
+        failure_summary = summary.get("failure_summary") or {}
+        if failure_summary.get("has_failures"):
+            transition = self._decide_failure_transition(failure_summary)
+            project["status"] = transition["status"]
+            project["stage"] = transition["stage"]
+            project["resolution"] = transition.get("resolution", {})
+            self.project_store.save(project_id, project)
+            return {
+                "ok": True,
+                "project_id": project_id,
+                "status": project["status"],
+                "stage": project["stage"],
+                "job_results": job_results,
+                "summary": summary,
+                "failure_transition": transition,
+            }
+
         decision_job = next((j for j in job_results if j.get("type") == "decision"), None)
         decision_result = decision_job.get("result", {}) if decision_job else {}
         overall_decision = decision_result.get("overall_decision")
+
+        identity_mismatch = any(
+            isinstance(t.get("identity"), dict) and t["identity"].get("matched") is False
+            for t in (summary.get("targets", []) or [])
+        )
+
+        if identity_mismatch:
+            project["status"] = "needs_clarification"
+            project["stage"] = "resolve"
+            project["resolution"] = {
+                "mode": "ASK",
+                "resolved_inputs": {},
+                "question": {
+                    "type": "fact",
+                    "field": "target_identity_mapping",
+                    "text": "요청한 target_id와 실제 응답한 agent_id가 일치하지 않음. 타겟 매핑을 확인해야 함.",
+                    "choices": [],
+                },
+                "approval_request": None,
+                "rationale": "Target identity mismatch detected during probe.",
+                "evidence_map": {},
+                "evidence_refs": [],
+            }
+            self.project_store.save(project_id, project)
+            return {
+                "ok": True,
+                "project_id": project_id,
+                "status": project["status"],
+                "stage": project["stage"],
+                "job_results": job_results,
+                "summary": summary,
+            }
 
         if all_prechecks_ok and probes_ok:
             project["resolution"] = {}
@@ -316,9 +389,15 @@ class SkillRunner:
             "targets": [],
             "decision": decision_job.get("result") if decision_job else None,
             "install": install_job.get("result") if install_job else None,
+            "artifacts": [],
             "overall_status": "unknown",
             "blockers": [],
             "next_actions": [],
+            "action_plan_ready": False,
+            "execution_ready": False,
+            "execution_ok": None,
+            "failure_summary": None,
+            "remediation_suggestions": [],
         }
 
         for job in probe_jobs:
@@ -328,6 +407,7 @@ class SkillRunner:
                 "ok": job.get("ok", False),
                 "health": result.get("health"),
                 "capabilities": result.get("capabilities"),
+                "identity": result.get("identity"),
                 "errors": result.get("errors", []),
             })
 
@@ -343,6 +423,16 @@ class SkillRunner:
             summary["blockers"].append(f"probe_failed:{', '.join(failed_targets)}")
             summary["next_actions"].append("Check target health/capabilities connectivity and rerun.")
             return summary
+
+        identity_mismatch_targets = [
+            t["target_id"]
+            for t in summary["targets"]
+            if isinstance(t.get("identity"), dict) and t["identity"].get("matched") is False
+        ]
+
+        if identity_mismatch_targets:
+            summary["blockers"].append(f"identity_mismatch:{', '.join(identity_mismatch_targets)}")
+            summary["next_actions"].append("Review target mapping because reported agent identity does not match requested target id.")
 
         decision = summary.get("decision") or {}
         overall_decision = decision.get("overall_decision")
@@ -365,6 +455,35 @@ class SkillRunner:
             summary["next_actions"].append("No installation blocker detected for currently reachable targets.")
 
         summary["next_actions"].append("Proceed to detailed onboarding execution in later milestones.")
+
+        if summary.get("install") and summary["install"].get("mode") == "approved_install_plan":
+            summary["artifacts"].append("install_subagent_plan.json")
+
+        install_info = summary.get("install") or {}
+        plans = install_info.get("plans", []) or []
+        execution = install_info.get("execution", {}) or {}
+
+        if any(p.get("actions") for p in plans):
+            summary["action_plan_ready"] = True
+
+        if execution:
+            summary["execution_ready"] = True
+            summary["execution_ok"] = execution.get("ok")
+            summary["failure_summary"] = execution.get("failure_summary")
+
+            if execution.get("ok"):
+                summary["next_actions"].append("Install action plan executed successfully in stub flow.")
+            else:
+                summary["blockers"].append("install_execution_failed")
+
+                failure_summary = execution.get("failure_summary", {}) or {}
+                for item in failure_summary.get("items", []) or []:
+                    suggestion = item.get("suggested_next_action")
+                    if suggestion and suggestion not in summary["remediation_suggestions"]:
+                        summary["remediation_suggestions"].append(suggestion)
+
+                summary["next_actions"].append("Review install_subagent_execution artifact and fix failing steps.")
+
         return summary
 
 
@@ -455,6 +574,7 @@ class SkillRunner:
     def _build_install_stub_result(self, decision_result: dict, approved: bool) -> dict:
         needs_targets = decision_result.get("needs_approval_targets", []) or []
         manual_targets = decision_result.get("manual_bootstrap_targets", []) or []
+        per_target = decision_result.get("per_target", []) or []
 
         if not needs_targets and not manual_targets:
             return {
@@ -462,6 +582,7 @@ class SkillRunner:
                 "mode": "skip",
                 "reason": "No installation-required targets detected.",
                 "targets": [],
+                "plans": [],
             }
 
         if not approved:
@@ -470,24 +591,58 @@ class SkillRunner:
                 "mode": "blocked",
                 "reason": "Approval not granted for install_subagent.",
                 "targets": needs_targets + manual_targets,
+                "plans": [],
             }
 
         plans = []
-        for target_id in needs_targets:
-            plans.append({
-                "target_id": target_id,
-                "action": "prepare_install_stub",
-                "status": "planned",
-                "reason": "Approval granted; installation stub can proceed in later milestones.",
-            })
 
-        for target_id in manual_targets:
-            plans.append({
-                "target_id": target_id,
-                "action": "manual_bootstrap_required",
-                "status": "blocked_manual",
-                "reason": "Approval granted but prerequisites are insufficient for automatic install.",
-            })
+        for item in per_target:
+            target_id = item.get("target_id")
+            decision = item.get("decision")
+            hints = item.get("capability_hints", {}) or {}
+
+            package_manager = hints.get("package_manager") or "unknown"
+            python_value = hints.get("python")
+            sudo_value = hints.get("sudo")
+
+            if decision == "installable_with_approval":
+                install_script = self._render_install_stub_script(
+                    package_manager=package_manager,
+                    python_value=python_value,
+                    needs_sudo=bool(sudo_value),
+                )
+                plans.append({
+                    "target_id": target_id,
+                    "action": "prepare_install_stub",
+                    "status": "planned",
+                    "reason": "Approval granted; installation stub can proceed in later milestones.",
+                    "package_manager": package_manager,
+                    "python": python_value,
+                    "needs_sudo": bool(sudo_value),
+                    "install_script": install_script,
+                    "actions": [],
+                    "notes": [
+                        "This is a generated install stub, not a live execution result.",
+                        "Later milestones should convert this plan into an executable tool action.",
+                    ],
+                })
+
+            elif decision == "manual_bootstrap_needed":
+                plans.append({
+                    "target_id": target_id,
+                    "action": "prepare_install_stub",
+                    "status": "planned",
+                    "reason": "Approval granted; installation stub can proceed in later milestones.",
+                    "package_manager": package_manager,
+                    "python": python_value,
+                    "needs_sudo": bool(sudo_value),
+                    "install_script": install_script,
+                    "actions": self._build_install_actions(target_id, install_script),
+                    "notes": [
+                        "This is a generated install stub, not a live execution result.",
+                        "The actions array is the next-step execution plan for later milestones.",
+                    ],
+                })
 
         return {
             "ok": True,
@@ -524,3 +679,302 @@ class SkillRunner:
             "status": project["status"],
             "stage": project["stage"],
         }
+    def _render_install_stub_script(self, package_manager: str, python_value: str | None, needs_sudo: bool) -> str:
+        sudo_prefix = "sudo " if needs_sudo else ""
+
+        if package_manager == "apt":
+            install_pkg = f"{sudo_prefix}apt-get update && {sudo_prefix}apt-get install -y python3 curl"
+        elif package_manager == "dnf":
+            install_pkg = f"{sudo_prefix}dnf install -y python3 curl"
+        elif package_manager == "yum":
+            install_pkg = f"{sudo_prefix}yum install -y python3 curl"
+        elif package_manager == "apk":
+            install_pkg = f"{sudo_prefix}apk add --no-cache python3 curl"
+        else:
+            install_pkg = "# TODO: detect/install prerequisites manually"
+
+        script = f"""#!/usr/bin/env bash
+    set -euo pipefail
+
+    # Install prerequisites
+    {install_pkg}
+
+    # Verify python
+    python3 --version || true
+
+    # Placeholder: download or place subagent package/binary
+    echo "TODO: download chassisclaw subagent package"
+
+    # Placeholder: create subagent working directory
+    mkdir -p ./chassisclaw-subagent
+
+    # Placeholder: install/start subagent
+    echo "TODO: install/start chassisclaw subagent"
+
+    # Placeholder: verify health endpoint
+    echo "TODO: verify subagent health"
+    """
+        return script
+
+    def _store_install_artifact(self, project: dict, install_result: dict) -> None:
+        artifacts = project.get("artifacts", []) or []
+        artifacts = [a for a in artifacts if a.get("type") != "install_subagent_plan"]
+        artifacts.append({
+            "type": "install_subagent_plan",
+            "name": "install_subagent_plan.json",
+            "data": install_result,
+        })
+        project["artifacts"] = artifacts
+
+    def _build_install_actions(self, target_id: str, install_script: str) -> list[dict]:
+        return [
+            {
+                "id": f"install_subagent_{target_id}",
+                "type": "shell",
+                "target_id": target_id,
+                "timeout_s": 300,
+                "script": install_script,
+                "expected_artifacts": [
+                    "install_stdout.log",
+                    "install_stderr.log"
+                ],
+            }
+        ]
+    
+    def _execute_install_actions(self, plans: list[dict]) -> dict:
+        executed = []
+
+        for plan in plans:
+            target_id = plan.get("target_id")
+            actions = plan.get("actions", []) or []
+            target = self.target_store.get(target_id)
+
+            if not target:
+                executed.append({
+                    "target_id": target_id,
+                    "ok": False,
+                    "error": "target_not_found",
+                    "results": [],
+                })
+                continue
+
+            action_results = []
+            all_ok = True
+
+            for action in actions:
+                result = self.subagent_client.run_script(
+                    base_url=target["base_url"],
+                    run_id=f"run_{uuid.uuid4().hex[:8]}",
+                    target_id=target_id,
+                    script=action.get("script", ""),
+                    timeout_s=int(action.get("timeout_s", 300)),
+                )
+
+                item = result.model_dump() if hasattr(result, "model_dump") else result
+                classification = self._classify_execution_failure(item)
+
+                action_results.append({
+                    "action_id": action.get("id"),
+                    "result": item,
+                    "classification": classification,
+                })
+
+                exit_code = item.get("exit_code", 1)
+                if exit_code != 0:
+                    all_ok = False
+
+            executed.append({
+                "target_id": target_id,
+                "ok": all_ok,
+                "results": action_results,
+            })
+
+        overall_ok = all(x.get("ok", False) for x in executed) if executed else False
+        failure_summary = self._summarize_execution_failures(executed)
+
+        return {
+            "ok": overall_ok,
+            "mode": "executed",
+            "executed_targets": executed,
+            "failure_summary": failure_summary,
+        }
+
+    def _store_install_execution_artifact(self, project: dict, execution_result: dict) -> None:
+        artifacts = project.get("artifacts", []) or []
+        artifacts = [a for a in artifacts if a.get("type") != "install_subagent_execution"]
+        artifacts.append({
+            "type": "install_subagent_execution",
+            "name": "install_subagent_execution.json",
+            "data": execution_result,
+        })
+        project["artifacts"] = artifacts
+
+    def _classify_execution_failure(self, result: dict) -> dict:
+        exit_code = int(result.get("exit_code", 0) or 0)
+        stdout = (result.get("stdout", "") or "").lower()
+        stderr = (result.get("stderr", "") or "").lower()
+        text = f"{stdout}\n{stderr}"
+
+        if exit_code == 0:
+            return {
+                "failure_type": None,
+                "reason": "success",
+                "suggested_next_action": "No action needed.",
+            }
+
+        if "command not found" in text or exit_code == 127:
+            return {
+                "failure_type": "command_not_found",
+                "reason": "Required command is not available in the target environment.",
+                "suggested_next_action": "Decide whether to install the missing tool, use an alternative command, or ask for approval.",
+            }
+
+        if "permission denied" in text or "not permitted" in text:
+            return {
+                "failure_type": "permission_denied",
+                "reason": "Command requires higher privileges or target permissions are insufficient.",
+                "suggested_next_action": "Request approval for elevated execution or adjust privilege strategy.",
+            }
+
+        if "timeout" in text or "timed out" in text:
+            return {
+                "failure_type": "timeout",
+                "reason": "Execution exceeded the expected time budget or remote command stalled.",
+                "suggested_next_action": "Retry with adjusted timeout, simplify the action, or probe connectivity first.",
+            }
+
+        if "network is unreachable" in text or "name or service not known" in text or "connection reset" in text:
+            return {
+                "failure_type": "network_unreachable",
+                "reason": "Target connectivity or name resolution failed during execution.",
+                "suggested_next_action": "Check connectivity, DNS, routing, or proxy/network policy before retrying.",
+            }
+
+        if "apt-get: not found" in text or "dnf: not found" in text or "yum: not found" in text or "apk: not found" in text:
+            return {
+                "failure_type": "package_manager_missing",
+                "reason": "Expected package manager is not available on the target.",
+                "suggested_next_action": "Probe the environment again to detect the correct package manager or prepare manual bootstrap.",
+            }
+
+        if "python3: not found" in text or "python: not found" in text:
+            return {
+                "failure_type": "python_missing",
+                "reason": "Python runtime required by the plan is not available.",
+                "suggested_next_action": "Install Python if approved, or switch to a shell-only bootstrap path.",
+            }
+
+        return {
+            "failure_type": "unknown_failure",
+            "reason": "Execution failed but did not match a known failure pattern.",
+            "suggested_next_action": "Inspect stderr/stdout and create a targeted remediation or fallback plan.",
+        }
+
+
+    def _summarize_execution_failures(self, executed_targets: list[dict]) -> dict:
+        items = []
+        seen_types = []
+
+        for target in executed_targets:
+            target_id = target.get("target_id")
+            for action_item in target.get("results", []) or []:
+                result = action_item.get("result", {}) or {}
+                classified = self._classify_execution_failure(result)
+                failure_type = classified.get("failure_type")
+                if failure_type:
+                    items.append({
+                        "target_id": target_id,
+                        "action_id": action_item.get("action_id"),
+                        "failure_type": failure_type,
+                        "reason": classified.get("reason"),
+                        "suggested_next_action": classified.get("suggested_next_action"),
+                    })
+                    if failure_type not in seen_types:
+                        seen_types.append(failure_type)
+
+        return {
+            "has_failures": bool(items),
+            "failure_types": seen_types,
+            "items": items,
+        }
+
+    def _decide_failure_transition(self, failure_summary: dict) -> dict:
+        failure_types = failure_summary.get("failure_types", []) or []
+
+        if not failure_types:
+            return {
+                "status": "planned",
+                "stage": "report",
+                "resolution": {},
+            }
+
+        if "permission_denied" in failure_types:
+            return {
+                "status": "needs_approval",
+                "stage": "resolve",
+                "resolution": {
+                    "mode": "APPROVAL",
+                    "resolved_inputs": {},
+                    "question": None,
+                    "approval_request": {
+                        "field": "elevated_execution",
+                        "text": "설치 실행에 더 높은 권한이 필요함. 권한 상승 또는 sudo 사용 승인이 필요함.",
+                        "risk": "high",
+                    },
+                    "rationale": "Install execution failed with permission_denied.",
+                    "evidence_map": {},
+                    "evidence_refs": [],
+                },
+            }
+
+        if "command_not_found" in failure_types or "package_manager_missing" in failure_types or "python_missing" in failure_types:
+            return {
+                "status": "needs_clarification",
+                "stage": "resolve",
+                "resolution": {
+                    "mode": "ASK",
+                    "resolved_inputs": {},
+                    "question": {
+                        "type": "fact",
+                        "field": "bootstrap_strategy",
+                        "text": "대상 환경에 필요한 명령/패키지가 없음. 도구 설치, 대체 도구 사용, 수동 부트스트랩 중 어떤 전략으로 진행할지 결정 필요.",
+                        "choices": [
+                            {"value": "install_missing_tools", "label": "누락 도구 설치"},
+                            {"value": "use_alternative_tools", "label": "대체 도구 사용"},
+                            {"value": "manual_bootstrap", "label": "수동 부트스트랩"},
+                        ],
+                    },
+                    "approval_request": None,
+                    "rationale": "Install execution failed due to missing environment prerequisites.",
+                    "evidence_map": {},
+                    "evidence_refs": [],
+                },
+            }
+
+        if "timeout" in failure_types or "network_unreachable" in failure_types:
+            return {
+                "status": "replan",
+                "stage": "replan",
+                "resolution": {},
+            }
+
+        return {
+            "status": "replan",
+            "stage": "replan",
+            "resolution": {},
+        }
+
+    def _check_target_identity(self, requested_target_id: str, probe_result: dict) -> dict:
+        health = probe_result.get("health", {}) or {}
+        body = health.get("body", {}) if isinstance(health.get("body"), dict) else {}
+
+        reported_agent_id = body.get("agent_id")
+        matched = (reported_agent_id == requested_target_id) if reported_agent_id else None
+
+        return {
+            "requested_target_id": requested_target_id,
+            "reported_agent_id": reported_agent_id,
+            "matched": matched,
+        }
+
+    

@@ -38,6 +38,7 @@ skill_runner = SkillRunner(
     skill_registry=skill_registry,
     project_store=project_store,
     target_store=target_store,
+    subagent_client=subagent_client,
 )
 skills_router.skill_runner = skill_runner
 
