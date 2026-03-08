@@ -398,6 +398,8 @@ class SkillRunner:
             "execution_ok": None,
             "failure_summary": None,
             "remediation_suggestions": [],
+            "bootstrap_targets": [],
+            "post_install_health": [],
         }
 
         for job in probe_jobs:
@@ -484,6 +486,33 @@ class SkillRunner:
 
                 summary["next_actions"].append("Review install_subagent_execution artifact and fix failing steps.")
 
+            executed_targets = execution.get("executed_targets", []) or []
+        failed_health_rechecks = [
+            x.get("target_id")
+            for x in executed_targets
+            if not (x.get("health_recheck", {}) or {}).get("ok", False)
+        ]
+        if failed_health_rechecks:
+            summary["blockers"].append(
+                f"post_install_health_check_failed:{', '.join(failed_health_rechecks)}"
+            )
+            summary["remediation_suggestions"].append(
+                "Review install logs and verify the subagent process/service is running before retrying."
+            )
+
+        for x in executed_targets:
+            if x.get("health_recheck") is not None:
+                summary["post_install_health"].append(x["health_recheck"])
+
+        install_info = summary.get("install") or {}
+        for plan in install_info.get("plans", []) or []:
+            summary["bootstrap_targets"].append({
+                "target_id": plan.get("target_id"),
+                "package_manager": plan.get("package_manager"),
+                "health_check_url": plan.get("health_check_url"),
+                "bootstrap_mode": plan.get("bootstrap_mode"),
+            })
+
         return summary
 
 
@@ -511,7 +540,8 @@ class SkillRunner:
         package_manager = capabilities_body.get("package_manager")
         python_value = capabilities_body.get("python")
         sudo_value = capabilities_body.get("sudo")
-                
+
+        '''        
         if health_ok:
             return {
                 "target_id": target_id,
@@ -520,7 +550,21 @@ class SkillRunner:
                 "reason": "Subagent health endpoint already responds successfully.",
                 "recommended_next_action": "Skip installation and continue onboarding.",
             }
-        
+        '''
+        if health_ok:
+            return {
+                "target_id": target_id,
+                "decision": "installable_with_approval",
+                "needs_approval": True,
+                "reason": "TEST MODE: force approval flow even though subagent health responds successfully.",
+                "recommended_next_action": "Request approval and prepare bootstrap/subagent installation.",
+                "capability_hints": {
+                    "package_manager": package_manager,
+                    "python": python_value,
+                    "sudo": sudo_value,
+                },
+            }
+
         if package_manager and python_value:
             return {
                 "target_id": target_id,
@@ -620,7 +664,9 @@ class SkillRunner:
                     "python": python_value,
                     "needs_sudo": bool(sudo_value),
                     "install_script": install_script,
-                    "actions": [],
+                    "actions": self._build_install_actions(target_id, install_script),
+                    "bootstrap_mode": "systemd_or_background",
+                    "health_check_url": "http://127.0.0.1:55123/health",
                     "notes": [
                         "This is a generated install stub, not a live execution result.",
                         "Later milestones should convert this plan into an executable tool action.",
@@ -683,36 +729,90 @@ class SkillRunner:
         sudo_prefix = "sudo " if needs_sudo else ""
 
         if package_manager == "apt":
-            install_pkg = f"{sudo_prefix}apt-get update && {sudo_prefix}apt-get install -y python3 curl"
+            install_pkg = f"{sudo_prefix}apt-get update && {sudo_prefix}apt-get install -y python3 curl ca-certificates"
         elif package_manager == "dnf":
-            install_pkg = f"{sudo_prefix}dnf install -y python3 curl"
+            install_pkg = f"{sudo_prefix}dnf install -y python3 curl ca-certificates"
         elif package_manager == "yum":
-            install_pkg = f"{sudo_prefix}yum install -y python3 curl"
+            install_pkg = f"{sudo_prefix}yum install -y python3 curl ca-certificates"
         elif package_manager == "apk":
-            install_pkg = f"{sudo_prefix}apk add --no-cache python3 curl"
+            install_pkg = f"{sudo_prefix}apk add --no-cache python3 curl ca-certificates"
         else:
             install_pkg = "# TODO: detect/install prerequisites manually"
+
+        service_block = f"""{sudo_prefix}mkdir -p /opt/chassisclaw/subagent
+    cat > /tmp/chassisclaw-subagent-placeholder.py <<'PYEOF'
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import json
+    import os
+
+    AGENT_ID = os.environ.get("CHASSISCLAW_AGENT_ID", "bootstrap-agent")
+
+    class H(BaseHTTPRequestHandler):
+        def _send(self, obj, code=200):
+            body = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path == "/health":
+                self._send({{"ok": True, "agent_id": AGENT_ID, "service": "chassisclaw-subagent-bootstrap"}})
+                return
+            self._send({{"ok": False, "error": "not_found"}}, 404)
+
+    HTTPServer(("0.0.0.0", 55123), H).serve_forever()
+    PYEOF
+
+    {sudo_prefix}cp /tmp/chassisclaw-subagent-placeholder.py /opt/chassisclaw/subagent/subagent.py
+    """
+
+        systemd_block = f"""if command -v systemctl >/dev/null 2>&1; then
+    cat > /tmp/chassisclaw-subagent.service <<'EOF'
+    [Unit]
+    Description=ChassisClaw SubAgent Placeholder
+    After=network.target
+
+    [Service]
+    Environment=CHASSISCLAW_AGENT_ID=$(hostname)
+    ExecStart=/usr/bin/python3 /opt/chassisclaw/subagent/subagent.py
+    Restart=always
+    RestartSec=3
+
+    [Install]
+    WantedBy=multi-user.target
+    EOF
+
+    {sudo_prefix}cp /tmp/chassisclaw-subagent.service /etc/systemd/system/chassisclaw-subagent.service
+    {sudo_prefix}systemctl daemon-reload
+    {sudo_prefix}systemctl enable --now chassisclaw-subagent.service
+    else
+    nohup python3 /opt/chassisclaw/subagent/subagent.py >/tmp/chassisclaw-subagent.out 2>/tmp/chassisclaw-subagent.err &
+    fi
+    """
+
+        verify_block = """sleep 2
+    curl -fsS http://127.0.0.1:55123/health || true
+    """
 
         script = f"""#!/usr/bin/env bash
     set -euo pipefail
 
-    # Install prerequisites
+    echo "[1/5] install prerequisites"
     {install_pkg}
 
-    # Verify python
+    echo "[2/5] verify python"
     python3 --version || true
 
-    # Placeholder: download or place subagent package/binary
-    echo "TODO: download chassisclaw subagent package"
+    echo "[3/5] place placeholder subagent"
+    {service_block}
 
-    # Placeholder: create subagent working directory
-    mkdir -p ./chassisclaw-subagent
+    echo "[4/5] start service or background process"
+    {systemd_block}
 
-    # Placeholder: install/start subagent
-    echo "TODO: install/start chassisclaw subagent"
-
-    # Placeholder: verify health endpoint
-    echo "TODO: verify subagent health"
+    echo "[5/5] verify local health"
+    {verify_block}
     """
         return script
 
@@ -783,10 +883,13 @@ class SkillRunner:
                 if exit_code != 0:
                     all_ok = False
 
+            health_recheck = self._recheck_subagent_health(target_id)
+
             executed.append({
                 "target_id": target_id,
-                "ok": all_ok,
+                "ok": all_ok and health_recheck.get("ok", False),
                 "results": action_results,
+                "health_recheck": health_recheck,
             })
 
         overall_ok = all(x.get("ok", False) for x in executed) if executed else False
@@ -977,4 +1080,30 @@ class SkillRunner:
             "matched": matched,
         }
 
+
+    def _recheck_subagent_health(self, target_id: str) -> dict:
+        target = self.target_store.get(target_id)
+        if not target:
+            return {
+                "target_id": target_id,
+                "ok": False,
+                "error": "target_not_found",
+            }
+
+        base_url = target["base_url"].rstrip("/")
+        try:
+            r = requests.get(f"{base_url}/health", timeout=5)
+            body = r.json() if r.headers.get("content-type", "").startswith("application/json") else r.text
+            return {
+                "target_id": target_id,
+                "ok": r.status_code < 400,
+                "status_code": r.status_code,
+                "body": body,
+            }
+        except Exception as e:
+            return {
+                "target_id": target_id,
+                "ok": False,
+                "error": str(e),
+            }
     
