@@ -581,3 +581,5 @@ TODO
 ## 12. 최종 한 줄 정의
 
 **ChassisClaw는 Master-Manager-SubAgent 구조 위에서, Agent가 Tool(OS 명령어, 동적 쉘 스크립트, OSS 다운로드·설치·실행, wrapper 생성)을 사용하고 그 stdout/stderr/evidence를 다시 읽어 다음 계획을 세우는 LangGraph+A2A 기반 AI 에이전트 오케스트레이션 시스템이다.**
+
+

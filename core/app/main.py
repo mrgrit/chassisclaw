@@ -3,6 +3,7 @@ from fastapi import FastAPI
 from app.api.health import router as health_router
 from app.api.projects import router as projects_router
 from app.api.targets import router as targets_router
+from app.api.assets import router as assets_router
 from app.api.answers import router as answers_router
 from app.api.approvals import router as approvals_router
 from app.api.llm import router as llm_router
@@ -17,6 +18,7 @@ from app.services.validation_service import ValidationService
 
 from app.storage.project_store import ProjectStore
 from app.storage.target_store import TargetStore
+from app.storage.asset_store import AssetStore
 
 from app.api.skills import router as skills_router
 from app.services.skill_registry import SkillRegistry
@@ -26,6 +28,7 @@ app = FastAPI(title="ChassisClaw Core")
 
 project_store = ProjectStore()
 target_store = TargetStore()
+asset_store = AssetStore()
 audit_service = AuditService()
 evidence_service = EvidenceService()
 llm_registry = LLMRegistry()
@@ -38,6 +41,7 @@ skill_runner = SkillRunner(
     skill_registry=skill_registry,
     project_store=project_store,
     target_store=target_store,
+    asset_store=asset_store,
     subagent_client=subagent_client,
 )
 skills_router.skill_runner = skill_runner
@@ -59,11 +63,13 @@ for r in [projects_router, targets_router, answers_router, approvals_router, run
     r.audit_service = audit_service
     r.probe_loop_service = probe_loop_service
 
+assets_router.asset_store = asset_store
 llm_router.llm_registry = llm_registry
 
 app.include_router(health_router)
 app.include_router(projects_router)
 app.include_router(targets_router)
+app.include_router(assets_router)
 app.include_router(answers_router)
 app.include_router(approvals_router)
 app.include_router(llm_router)

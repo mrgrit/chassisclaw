@@ -3,17 +3,17 @@
   "title": "ops.onboard.two_node inputs",
   "type": "object",
   "required": [
-    "node_a_target_id",
-    "node_b_target_id"
+    "node_a_asset_id",
+    "node_b_asset_id"
   ],
   "properties": {
-    "node_a_target_id": {
+    "node_a_asset_id": {
       "type": "string",
-      "description": "First target identifier"
+      "description": "First asset identifier"
     },
-    "node_b_target_id": {
+    "node_b_asset_id": {
       "type": "string",
-      "description": "Second target identifier"
+      "description": "Second asset identifier"
     },
     "ssh_username": {
       "type": "string"
@@ -28,7 +28,13 @@
     },
     "package_manager_hint": {
       "type": "string",
-      "enum": ["apt", "dnf", "yum", "apk", "unknown"]
+      "enum": [
+        "apt",
+        "dnf",
+        "yum",
+        "apk",
+        "unknown"
+      ]
     },
     "internal_cidr": {
       "type": "string"

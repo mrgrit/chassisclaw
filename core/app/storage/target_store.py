@@ -2,6 +2,7 @@ from pathlib import Path
 from .paths import TARGETS_DIR
 from .json_store import read_json, write_json
 
+
 class TargetStore:
     def __init__(self, base_dir: Path = TARGETS_DIR):
         self.base_dir = base_dir
@@ -28,3 +29,27 @@ class TargetStore:
 
     def list(self):
         return [read_json(p, {}) for p in sorted(self.base_dir.glob("*.json"))]
+
+    def build_target_from_asset(self, asset: dict) -> dict | None:
+        mgmt_ip = asset.get("mgmt_ip")
+        port = asset.get("expected_subagent_port") or 55123
+        if not mgmt_ip:
+            return None
+
+        return {
+            "id": f"resolved-{asset['id']}",
+            "name": asset.get("name", asset["id"]),
+            "base_url": f"http://{mgmt_ip}:{port}",
+            "mode": "http",
+            "tags": asset.get("roles", []),
+            "asset_id": asset["id"],
+        }
+
+
+    def refresh_from_asset(self, asset: dict) -> dict | None:
+        target = self.build_target_from_asset(asset)
+        if not target:
+            return None
+
+        self.upsert(target["id"], target)
+        return target

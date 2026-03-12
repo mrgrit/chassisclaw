@@ -1,0 +1,953 @@
+--- a/core/app/api/assets.py
++++ b/core/app/api/assets.py
+@@ -1,101 +1,32 @@
+-from datetime import datetime, timezone
+ from fastapi import APIRouter, HTTPException
+-import requests
+-
+-from app.models.asset import AssetUpsertReq, AssetPatchReq
++from app.models.asset import AssetUpsertReq
+ 
+ router = APIRouter()
+ 
+ 
+-def _merge_patch(current: dict, patch: dict) -> dict:
+-    merged = dict(current)
+-    for k, v in patch.items():
+-        if v is not None:
+-            merged[k] = v
+-    return merged
++@router.get("/assets")
++def list_assets():
++    return {"items": router.asset_store.list()}
+ 
+ 
+-@router.get('/assets')
+-def list_assets():
+-    return {'items': router.asset_store.list()}
+-
+-
+-@router.get('/assets/{asset_id}')
++@router.get("/assets/{asset_id}")
+ def get_asset(asset_id: str):
+     asset = router.asset_store.get(asset_id)
+     if not asset:
+-        raise HTTPException(status_code=404, detail='asset not found')
++        raise HTTPException(status_code=404, detail="asset not found")
+     return asset
+ 
+ 
+-@router.post('/assets')
+-def create_or_replace_asset(req: AssetUpsertReq):
++@router.post("/assets")
++def upsert_asset(req: AssetUpsertReq):
+     payload = req.model_dump()
+-    router.asset_store.save(req.id, payload)
++    router.asset_store.upsert(req.id, payload)
+     return payload
+ 
+ 
+-@router.patch('/assets/{asset_id}')
+-def patch_asset(asset_id: str, req: AssetPatchReq):
+-    current = router.asset_store.get(asset_id)
+-    if not current:
+-        raise HTTPException(status_code=404, detail='asset not found')
+-    merged = _merge_patch(current, req.model_dump(exclude_unset=True))
+-    router.asset_store.save(asset_id, merged)
+-    return merged
+-
+-
+-@router.delete('/assets/{asset_id}')
++@router.delete("/assets/{asset_id}")
+ def delete_asset(asset_id: str):
+     deleted = router.asset_store.delete(asset_id)
+     if not deleted:
+-        raise HTTPException(status_code=404, detail='asset not found')
+-    return {'ok': True, 'asset_id': asset_id}
+-
+-
+-@router.post('/assets/{asset_id}/probe_subagent')
+-def probe_subagent(asset_id: str):
+-    asset = router.asset_store.get(asset_id)
+-    if not asset:
+-        raise HTTPException(status_code=404, detail='asset not found')
+-
+-    subagent = asset.get('subagent', {}) or {}
+-    base_url = subagent.get('base_url')
+-    if not base_url:
+-        port = (asset.get('metadata', {}) or {}).get('expected_subagent_port', 55123)
+-        base_url = f"http://{asset['address']}:{port}"
+-
+-    result = {
+-        'asset_id': asset_id,
+-        'base_url': base_url.rstrip('/'),
+-        'ok': False,
+-        'health': None,
+-        'capabilities': None,
+-        'errors': [],
+-    }
+-
+-    try:
+-        r = requests.get(f"{result['base_url']}/health", timeout=5)
+-        result['health'] = {'status_code': r.status_code, 'body': r.json() if 'application/json' in r.headers.get('content-type', '') else r.text}
+-    except Exception as e:
+-        result['errors'].append(f'health_error: {e}')
+-
+-    try:
+-        r = requests.get(f"{result['base_url']}/capabilities", timeout=5)
+-        result['capabilities'] = {'status_code': r.status_code, 'body': r.json() if 'application/json' in r.headers.get('content-type', '') else r.text}
+-    except Exception as e:
+-        result['errors'].append(f'capabilities_error: {e}')
+-
+-    result['ok'] = bool((result['health'] and result['health']['status_code'] < 500) or (result['capabilities'] and result['capabilities']['status_code'] < 500))
+-
+-    updated = dict(asset)
+-    updated_subagent = dict(subagent)
+-    updated_subagent['reachable'] = result['ok']
+-    updated_subagent['base_url'] = result['base_url']
+-    updated_subagent['last_seen'] = datetime.now(timezone.utc).isoformat()
+-    if isinstance((result.get('health') or {}).get('body'), dict):
+-        updated_subagent['agent_id'] = result['health']['body'].get('agent_id') or updated_subagent.get('agent_id')
+-        updated_subagent['installed'] = bool(result['health']['body'].get('ok'))
+-    updated['subagent'] = updated_subagent
+-    router.asset_store.save(asset_id, updated)
+-    return result
++        raise HTTPException(status_code=404, detail="asset not found")
++    return {"ok": True, "deleted": asset_id}
+--- a/core/app/main.py
++++ b/core/app/main.py
+@@ -8,6 +8,7 @@
+ from app.api.approvals import router as approvals_router
+ from app.api.llm import router as llm_router
+ from app.api.run_auto import router as run_auto_router
++from app.api.skills import router as skills_router
+ 
+ from app.services.audit_service import AuditService
+ from app.services.evidence_service import EvidenceService
+@@ -15,20 +16,18 @@
+ from app.services.probe_loop_service import ProbeLoopService
+ from app.services.subagent_client import SubAgentClient
+ from app.services.validation_service import ValidationService
++from app.services.skill_registry import SkillRegistry
++from app.services.skill_runner import SkillRunner
+ 
+ from app.storage.project_store import ProjectStore
+ from app.storage.target_store import TargetStore
+ from app.storage.asset_store import AssetStore
+ 
+-from app.api.skills import router as skills_router
+-from app.services.skill_registry import SkillRegistry
+-from app.services.skill_runner import SkillRunner
+-
+ app = FastAPI(title="ChassisClaw Core")
+ 
+ project_store = ProjectStore()
++target_store = TargetStore()
+ asset_store = AssetStore()
+-target_store = TargetStore()
+ audit_service = AuditService()
+ evidence_service = EvidenceService()
+ llm_registry = LLMRegistry()
+@@ -40,8 +39,8 @@
+ skill_runner = SkillRunner(
+     skill_registry=skill_registry,
+     project_store=project_store,
++    target_store=target_store,
+     asset_store=asset_store,
+-    target_store=target_store,
+     subagent_client=subagent_client,
+ )
+ skills_router.skill_runner = skill_runner
+@@ -57,10 +56,10 @@
+ llm_registry.register_connection("master-default", {"id": "master-default", "provider": "stub", "model": "stub-master"})
+ llm_registry.bind_role("master", "master-default")
+ 
+-for r in [projects_router, assets_router, targets_router, answers_router, approvals_router, run_auto_router]:
++for r in [projects_router, targets_router, assets_router, answers_router, approvals_router, run_auto_router]:
+     r.project_store = project_store
++    r.target_store = target_store
+     r.asset_store = asset_store
+-    r.target_store = target_store
+     r.audit_service = audit_service
+     r.probe_loop_service = probe_loop_service
+ 
+@@ -68,10 +67,10 @@
+ 
+ app.include_router(health_router)
+ app.include_router(projects_router)
++app.include_router(targets_router)
+ app.include_router(assets_router)
+-app.include_router(targets_router)
+ app.include_router(answers_router)
+ app.include_router(approvals_router)
+ app.include_router(llm_router)
+ app.include_router(run_auto_router)
+-app.include_router(skills_router)+app.include_router(skills_router)
+--- a/core/app/models/asset.py
++++ b/core/app/models/asset.py
+@@ -1,35 +1,22 @@
+-from typing import Any, Literal
++from typing import Any
+ from pydantic import BaseModel, Field
+-
+-
+-class AssetSubagentState(BaseModel):
+-    installed: bool = False
+-    reachable: bool = False
+-    base_url: str | None = None
+-    agent_id: str | None = None
+-    last_seen: str | None = None
+ 
+ 
+ class AssetUpsertReq(BaseModel):
+     id: str
+     name: str
+-    kind: Literal["server", "vm", "container", "device"] = "vm"
+-    address: str
+-    platform: str = "linux"
+-    tags: list[str] = Field(default_factory=list)
+-    owner: str | None = None
+-    status: str = "registered"
+-    subagent: AssetSubagentState = Field(default_factory=AssetSubagentState)
++    type: str = "vm"
++    mgmt_ip: str
++    env: str = "lab"
++    roles: list[str] = Field(default_factory=list)
++    expected_subagent_port: int = 55123
++    auth_ref: str | None = None
+     metadata: dict[str, Any] = Field(default_factory=dict)
+ 
+ 
+-class AssetPatchReq(BaseModel):
+-    name: str | None = None
+-    kind: Literal["server", "vm", "container", "device"] | None = None
+-    address: str | None = None
+-    platform: str | None = None
+-    tags: list[str] | None = None
+-    owner: str | None = None
+-    status: str | None = None
+-    subagent: AssetSubagentState | None = None
+-    metadata: dict[str, Any] | None = None
++class AssetResolveResult(BaseModel):
++    asset_id: str
++    target_id: str
++    base_url: str
++    mode: str = "subagent_http"
++    tags: list[str] = Field(default_factory=list)
+--- a/core/app/models/target.py
++++ b/core/app/models/target.py
+@@ -1,12 +1,7 @@
+-from typing import Any
+ from pydantic import BaseModel, Field
+-
+ 
+ class TargetUpsertReq(BaseModel):
+     id: str
+-    asset_id: str | None = None
+-    resolver_type: str = "asset_subagent"
+     base_url: str
+     mode: str = "subagent_http"
+-    capabilities: dict[str, Any] = Field(default_factory=dict)
+     tags: list[str] = Field(default_factory=list)
+--- a/core/app/services/skill_runner.py
++++ b/core/app/services/skill_runner.py
+@@ -6,11 +6,11 @@
+ 
+ 
+ class SkillRunner:
+-    def __init__(self, skill_registry, project_store, asset_store, target_store, subagent_client):
++    def __init__(self, skill_registry, project_store, target_store, asset_store, subagent_client):
+         self.skill_registry = skill_registry
+         self.project_store = project_store
++        self.target_store = target_store
+         self.asset_store = asset_store
+-        self.target_store = target_store
+         self.subagent_client = subagent_client
+ 
+     def _load_inputs_schema(self, skill_id: str) -> dict | None:
+@@ -45,16 +45,14 @@
+     def _get_asset(self, asset_id: str) -> dict | None:
+         return self.asset_store.get(asset_id)
+ 
+-    def _materialize_target_from_asset(self, asset: dict) -> dict:
++    def _resolve_asset_target(self, asset: dict) -> dict:
+         return self.target_store.refresh_from_asset(asset)
+ 
+-    def _probe_asset_subagent(self, asset: dict) -> dict:
+-        target = self._materialize_target_from_asset(asset)
++    def _probe_asset_subagent(self, asset: dict, target: dict) -> dict:
+         base_url = target["base_url"].rstrip("/")
+         out = {
+             "asset_id": asset["id"],
+             "target_id": target["id"],
+-            "expected_address": asset.get("address"),
+             "base_url": base_url,
+             "health": None,
+             "capabilities": None,
+@@ -79,7 +77,7 @@
+         ) or bool(
+             out["capabilities"] and out["capabilities"]["status_code"] < 500
+         )
+-        identity = self._check_asset_identity(asset, out)
++        identity = self._check_target_identity(asset["id"], out)
+         out["identity"] = identity
+ 
+         return out
+@@ -191,7 +189,7 @@
+                 continue
+ 
+             if job_type == "probe":
+-                asset_input = job.get("asset_input")
++                asset_input = job.get("target_input")
+                 asset_id = skill_inputs.get(asset_input)
+                 asset = self._get_asset(asset_id) if asset_id else None
+ 
+@@ -205,13 +203,14 @@
+                     })
+                     continue
+ 
+-                probe_result = self._probe_asset_subagent(asset)
++                target = self._resolve_asset_target(asset)
++                probe_result = self._probe_asset_subagent(asset, target)
+                 job_results.append({
+                     "job_id": job_id,
+                     "type": job_type,
+                     "ok": probe_result["ok"],
+                     "asset_id": asset_id,
+-                    "target_id": probe_result.get("target_id"),
++                    "target_id": target.get("id"),
+                     "result": probe_result,
+                 })
+                 continue
+@@ -369,11 +368,11 @@
+                 "question": {
+                     "type": "fact",
+                     "field": "asset_identity_mapping",
+-                    "text": "요청한 asset과 실제 응답한 subagent identity가 일치하지 않음. asset-agent 매핑을 확인해야 함.",
++                    "text": "요청한 asset_id와 실제 응답한 agent_id가 일치하지 않음. 자산 매핑을 확인해야 함.",
+                     "choices": [],
+                 },
+                 "approval_request": None,
+-                "rationale": "Asset-agent identity mismatch detected during probe.",
++                "rationale": "Asset identity mismatch detected during probe.",
+                 "evidence_map": {},
+                 "evidence_refs": [],
+             }
+@@ -404,7 +403,7 @@
+                         "question": None,
+                         "approval_request": {
+                             "field": "install_subagent",
+-                            "text": f"다음 타겟에 subagent/bootstrap 설치 승인이 필요함: {', '.join(decision_result.get('needs_approval_targets', []))}",
++                            "text": f"다음 자산에 subagent/bootstrap 설치 승인이 필요함: {', '.join(decision_result.get('needs_approval_assets', []))}",
+                             "risk": "high",
+                         },
+                         "rationale": "Decision stub determined that installation approval is required.",
+@@ -465,8 +464,8 @@
+         for job in probe_jobs:
+             result = job.get("result", {}) or {}
+             summary["assets"].append({
+-                "asset_id": job.get("asset_id"),
+-                "target_id": job.get("target_id"),
++                "asset_id": job.get("asset_id") or result.get("asset_id"),
++                "target_id": job.get("target_id") or result.get("target_id"),
+                 "ok": job.get("ok", False),
+                 "health": result.get("health"),
+                 "capabilities": result.get("capabilities"),
+@@ -495,7 +494,7 @@
+ 
+         if identity_mismatch_assets:
+             summary["blockers"].append(f"identity_mismatch:{', '.join(identity_mismatch_assets)}")
+-            summary["next_actions"].append("Review asset-agent mapping because reported identity does not match the registered asset.")
++            summary["next_actions"].append("Review asset mapping because reported agent identity does not match requested asset id.")
+ 
+         decision = summary.get("decision") or {}
+         overall_decision = decision.get("overall_decision")
+@@ -505,200 +504,54 @@
+ 
+         if overall_decision == "manual_action_needed":
+             summary["overall_status"] = "manual_action_needed"
+-            summary["next_actions"].append("Prepare manual bootstrap path for targets lacking installation prerequisites.")
++            summary["next_actions"].append("Prepare manual bootstrap path for assets lacking installation prerequisites.")
+         elif overall_decision == "approval_needed":
+             if install_mode == "approved_install_plan":
+                 summary["overall_status"] = "install_planned"
+                 summary["next_actions"].append("Installation stub plan created after approval.")
+             else:
+                 summary["overall_status"] = "approval_needed"
+-                summary["next_actions"].append("Request approval for subagent/bootstrap installation on required targets.")
++                summary["next_actions"].append("Request approval for subagent/bootstrap installation on required assets.")
+         else:
+             summary["overall_status"] = "ready"
+-            summary["next_actions"].append("No installation blocker detected for currently reachable targets.")
++            summary["next_actions"].append("No installation blocker detected for currently reachable assets.")
+ 
+         summary["next_actions"].append("Proceed to detailed onboarding execution in later milestones.")
+-
+-        install_info = summary.get("install") or {}
+-        plans = install_info.get("plans", []) or []
+-        execution = install_info.get("execution", {}) or {}
+-
+-        if any(p.get("actions") for p in plans):
+-            summary["action_plan_ready"] = True
+-
+-        if execution:
+-            summary["execution_ready"] = True
+-            summary["execution_ok"] = execution.get("ok")
+-            summary["failure_summary"] = execution.get("failure_summary")
+-
+-            if execution.get("ok"):
+-                summary["next_actions"].append("Install action plan executed successfully in stub flow.")
+-            else:
+-                summary["blockers"].append("install_execution_failed")
+-
+-                failure_summary = execution.get("failure_summary", {}) or {}
+-                for item in failure_summary.get("items", []) or []:
+-                    suggestion = item.get("suggested_next_action")
+-                    if suggestion and suggestion not in summary["remediation_suggestions"]:
+-                        summary["remediation_suggestions"].append(suggestion)
+-
+-                summary["next_actions"].append("Review install_subagent_execution artifact and fix failing steps.")
+-
+-            executed_targets = execution.get("executed_targets", []) or []
+-
+-            failed_health_rechecks = [
+-                x.get("target_id")
+-                for x in executed_targets
+-                if not (x.get("health_recheck", {}) or {}).get("ok", False)
+-            ]
+-            if failed_health_rechecks:
+-                summary["blockers"].append(
+-                    f"post_install_health_check_failed:{', '.join(failed_health_rechecks)}"
+-                )
+-                summary["remediation_suggestions"].append(
+-                    "Review install logs and verify the subagent process/service is running before retrying."
+-                )
+-
+-            for x in executed_targets:
+-                if x.get("health_recheck") is not None:
+-                    summary["post_install_health"].append(x["health_recheck"])
+-
+-            for item in executed_targets:
+-                target_id = item.get("target_id")
+-                if item.get("ok", False):
+-                    summary["successful_bootstrap_assets"].append(target_id)
+-                else:
+-                    summary["failed_bootstrap_assets"].append(target_id)
+-
+-            if summary["failed_bootstrap_assets"]:
+-                summary["next_actions"].append(
+-                    f"Investigate failed bootstrap assets: {', '.join(summary['failed_bootstrap_assets'])}."
+-                )
+-
+-        for plan in install_info.get("plans", []) or []:
+-            summary["bootstrap_assets"].append({
+-                "target_id": plan.get("target_id"),
+-                "package_manager": plan.get("package_manager"),
+-                "health_check_url": plan.get("health_check_url"),
+-                "bootstrap_mode": plan.get("bootstrap_mode"),
+-            })
+-
+-        #if summary.get("install") and summary["install"].get("mode") == "approved_install_plan":
+-        #    summary["artifacts"].append("install_subagent_plan.json")
+-
+         return summary
+-
+-
+-    def _store_summary_artifact(self, project: dict, summary: dict) -> None:
+-        artifacts = project.get("artifacts", []) or []
+-        artifacts = [a for a in artifacts if a.get("type") != "onboarding_summary"]
+-        artifacts.append({
+-            "type": "onboarding_summary",
+-            "name": "onboarding_summary.json",
+-            "data": summary,
+-        })
+-        project["artifacts"] = artifacts
+-
+-    def _decide_subagent_install_for_target(self, probe_job_result: dict) -> dict:
+-        target_id = probe_job_result.get("target_id")
+-        result = probe_job_result.get("result", {}) or {}
+-
+-        health = result.get("health", {}) or {}
+-        capabilities = result.get("capabilities", {}) or {}
+-
+-        health_body = health.get("body", {}) if isinstance(health.get("body"), dict) else {}
+-        capabilities_body = capabilities.get("body", {}) if isinstance(capabilities.get("body"), dict) else {}
+-
+-        health_ok = bool(health and int(health.get("status_code", 0) or 0) < 400 and health_body.get("ok") is True)
+-        package_manager = capabilities_body.get("package_manager")
+-        python_value = capabilities_body.get("python")
+-        sudo_value = capabilities_body.get("sudo")
+-
+-        '''        
+-        if health_ok:
+-            return {
+-                "target_id": target_id,
+-                "decision": "already_present",
+-                "needs_approval": False,
+-                "reason": "Subagent health endpoint already responds successfully.",
+-                "recommended_next_action": "Skip installation and continue onboarding.",
+-            }
+-        '''
+-        if health_ok:
+-            return {
+-                "target_id": target_id,
+-                "decision": "installable_with_approval",
+-                "needs_approval": True,
+-                "reason": "TEST MODE: force approval flow even though subagent health responds successfully.",
+-                "recommended_next_action": "Request approval and prepare bootstrap/subagent installation.",
+-                "capability_hints": {
+-                    "package_manager": package_manager,
+-                    "python": python_value,
+-                    "sudo": sudo_value,
+-                },
+-            }
+-
+-        if package_manager and python_value:
+-            return {
+-                "target_id": target_id,
+-                "decision": "installable_with_approval",
+-                "needs_approval": True,
+-                "reason": f"Subagent health is unavailable, but package manager={package_manager} and python={python_value} are present.",
+-                "recommended_next_action": "Request approval and prepare bootstrap/subagent installation.",
+-                "capability_hints": {
+-                    "package_manager": package_manager,
+-                    "python": python_value,
+-                    "sudo": sudo_value,
+-                },
+-            }
+-
+-        return {
+-            "target_id": target_id,
+-            "decision": "manual_bootstrap_needed",
+-            "needs_approval": True,
+-            "reason": "Subagent is not reachable and installation prerequisites are incomplete or unknown.",
+-            "recommended_next_action": "Collect more environment facts or perform manual bootstrap preparation.",
+-            "capability_hints": {
+-                "package_manager": package_manager,
+-                "python": python_value,
+-                "sudo": sudo_value,
+-            },
+-        }
+-
+ 
+     def _build_decision_summary(self, job_results: list[dict]) -> dict:
+         probe_jobs = [j for j in job_results if j.get("type") == "probe"]
+         per_target = [self._decide_subagent_install_for_target(j) for j in probe_jobs]
+ 
+-        needs_approval_targets = [x["target_id"] for x in per_target if x.get("needs_approval")]
++        needs_approval_assets = [x["target_id"] for x in per_target if x.get("needs_approval")]
+         already_present_targets = [x["target_id"] for x in per_target if x.get("decision") == "already_present"]
+         manual_targets = [x["target_id"] for x in per_target if x.get("decision") == "manual_bootstrap_needed"]
+ 
+         overall = "ready"
+         if manual_targets:
+             overall = "manual_action_needed"
+-        elif needs_approval_targets:
++        elif needs_approval_assets:
+             overall = "approval_needed"
+ 
+         return {
+             "overall_decision": overall,
+             "already_present_targets": already_present_targets,
+-            "needs_approval_targets": needs_approval_targets,
+-            "manual_bootstrap_targets": manual_targets,
++            "needs_approval_assets": needs_approval_assets,
++            "manual_bootstrap_assets": manual_targets,
+             "per_target": per_target,
+         }
+ 
+     def _build_install_stub_result(self, decision_result: dict, approved: bool) -> dict:
+-        needs_targets = decision_result.get("needs_approval_targets", []) or []
+-        manual_targets = decision_result.get("manual_bootstrap_targets", []) or []
++        needs_targets = decision_result.get("needs_approval_assets", []) or []
++        manual_targets = decision_result.get("manual_bootstrap_assets", []) or []
+         per_target = decision_result.get("per_target", []) or []
+ 
+         if not needs_targets and not manual_targets:
+             return {
+                 "ok": True,
+                 "mode": "skip",
+-                "reason": "No installation-required targets detected.",
+-                "assets": [],
++                "reason": "No installation-required assets detected.",
++                "targets": [],
+                 "plans": [],
+             }
+ 
+@@ -747,11 +600,16 @@
+                 })
+ 
+             elif decision == "manual_bootstrap_needed":
++                install_script = self._render_install_stub_script(
++                    package_manager=package_manager,
++                    python_value=python_value,
++                    needs_sudo=bool(sudo_value),
++                )
+                 plans.append({
+                     "target_id": target_id,
+                     "action": "prepare_install_stub",
+                     "status": "planned",
+-                    "reason": "Approval granted; installation stub can proceed in later milestones.",
++                    "reason": "Approval granted, but manual bootstrap review is still required.",
+                     "package_manager": package_manager,
+                     "python": python_value,
+                     "needs_sudo": bool(sudo_value),
+@@ -798,6 +656,42 @@
+             "status": project["status"],
+             "stage": project["stage"],
+         }
++    def _decide_subagent_install_for_target(self, probe_job: dict) -> dict:
++        result = probe_job.get("result", {}) or {}
++        asset_id = probe_job.get("asset_id") or result.get("asset_id")
++        target_id = probe_job.get("target_id") or result.get("target_id")
++        health = result.get("health", {}) or {}
++        capabilities = result.get("capabilities", {}) or {}
++
++        health_body = health.get("body") if isinstance(health.get("body"), dict) else {}
++        capabilities_body = capabilities.get("body") if isinstance(capabilities.get("body"), dict) else {}
++
++        capability_hints = {
++            "package_manager": capabilities_body.get("package_manager") or capabilities_body.get("pkg_manager") or "unknown",
++            "python": capabilities_body.get("python") or capabilities_body.get("python_version"),
++            "sudo": capabilities_body.get("sudo") if isinstance(capabilities_body.get("sudo"), bool) else True,
++        }
++
++        agent_id = capabilities_body.get("agent_id") or health_body.get("agent_id")
++        service_present = bool(agent_id) or bool(capabilities_body)
++
++        if probe_job.get("ok") and service_present:
++            decision = "already_present"
++        elif capability_hints["package_manager"] == "unknown":
++            decision = "manual_bootstrap_needed"
++        else:
++            decision = "installable_with_approval"
++
++        return {
++            "asset_id": asset_id,
++            "target_id": target_id,
++            "decision": decision,
++            "needs_approval": decision == "installable_with_approval",
++            "capability_hints": capability_hints,
++            "probe_ok": probe_job.get("ok", False),
++            "reported_agent_id": agent_id,
++        }
++
+     def _render_install_stub_script(self, package_manager: str, python_value: str | None, needs_sudo: bool) -> str:
+         sudo_prefix = "sudo " if needs_sudo else ""
+ 
+@@ -921,6 +815,16 @@
+             {verify_block}
+         """)
+         return script
++
++    def _store_summary_artifact(self, project: dict, summary: dict) -> None:
++        artifacts = project.get("artifacts", []) or []
++        artifacts = [a for a in artifacts if a.get("type") != "onboarding_summary"]
++        artifacts.append({
++            "type": "onboarding_summary",
++            "name": "onboarding_summary.json",
++            "data": summary,
++        })
++        project["artifacts"] = artifacts
+ 
+     def _store_install_artifact(self, project: dict, install_result: dict) -> None:
+         artifacts = project.get("artifacts", []) or []
+@@ -1200,28 +1104,16 @@
+             "resolution": {},
+         }
+ 
+-    def _check_asset_identity(self, asset: dict, probe_result: dict) -> dict:
++    def _check_target_identity(self, requested_target_id: str, probe_result: dict) -> dict:
+         health = probe_result.get("health", {}) or {}
+         body = health.get("body", {}) if isinstance(health.get("body"), dict) else {}
+ 
+         reported_agent_id = body.get("agent_id")
+-        reported_base_url = probe_result.get("base_url")
+-        expected_agent_id = ((asset.get("subagent") or {}).get("agent_id"))
+-        expected_base_url = ((asset.get("subagent") or {}).get("base_url")) or reported_base_url
+-
+-        matched = None
+-        if expected_agent_id and reported_agent_id:
+-            matched = expected_agent_id == reported_agent_id
+-        elif expected_base_url and reported_base_url:
+-            matched = expected_base_url.rstrip("/") == reported_base_url.rstrip("/")
++        matched = (reported_agent_id == requested_target_id) if reported_agent_id else None
+ 
+         return {
+-            "requested_asset_id": asset.get("id"),
+-            "expected_address": asset.get("address"),
+-            "expected_agent_id": expected_agent_id,
+-            "expected_base_url": expected_base_url,
++            "requested_target_id": requested_target_id,
+             "reported_agent_id": reported_agent_id,
+-            "reported_base_url": reported_base_url,
+             "matched": matched,
+         }
+ 
+--- a/core/app/storage/asset_store.py
++++ b/core/app/storage/asset_store.py
+@@ -11,7 +11,7 @@
+     def _path(self, asset_id: str) -> Path:
+         return self.base_dir / f"{asset_id}.json"
+ 
+-    def save(self, asset_id: str, payload: dict) -> dict:
++    def upsert(self, asset_id: str, payload: dict) -> dict:
+         return write_json(self._path(asset_id), payload)
+ 
+     def get(self, asset_id: str):
+@@ -20,9 +20,6 @@
+             return None
+         return read_json(path, {})
+ 
+-    def list(self):
+-        return [read_json(p, {}) for p in sorted(self.base_dir.glob('*.json'))]
+-
+     def delete(self, asset_id: str) -> bool:
+         path = self._path(asset_id)
+         if not path.exists():
+@@ -30,5 +27,5 @@
+         path.unlink()
+         return True
+ 
+-    def exists(self, asset_id: str) -> bool:
+-        return self._path(asset_id).exists()
++    def list(self):
++        return [read_json(p, {}) for p in sorted(self.base_dir.glob("*.json"))]
+--- a/core/app/storage/target_store.py
++++ b/core/app/storage/target_store.py
+@@ -1,6 +1,7 @@
+ from pathlib import Path
+ from .paths import TARGETS_DIR
+ from .json_store import read_json, write_json
++
+ 
+ class TargetStore:
+     def __init__(self, base_dir: Path = TARGETS_DIR):
+@@ -30,21 +31,19 @@
+         return [read_json(p, {}) for p in sorted(self.base_dir.glob("*.json"))]
+ 
+     def build_target_from_asset(self, asset: dict) -> dict:
+-        subagent = asset.get("subagent", {}) or {}
+-        base_url = subagent.get("base_url")
+-        if not base_url:
+-            port = (asset.get("metadata", {}) or {}).get("expected_subagent_port", 55123)
+-            base_url = f"http://{asset['address']}:{port}"
+-        return {
+-            "id": asset["id"],
++        target_id = f"resolved-{asset['id']}"
++        port = asset.get("expected_subagent_port", 55123)
++        mgmt_ip = asset["mgmt_ip"]
++        payload = {
++            "id": target_id,
+             "asset_id": asset["id"],
+-            "resolver_type": "asset_subagent",
+-            "base_url": base_url.rstrip("/"),
++            "base_url": f"http://{mgmt_ip}:{port}",
+             "mode": "subagent_http",
+-            "capabilities": asset.get("capabilities", {}) or {},
+-            "tags": asset.get("tags", []) or [],
++            "tags": list(asset.get("roles", [])),
++            "resolved_from": "asset",
+         }
++        self.upsert(target_id, payload)
++        return payload
+ 
+     def refresh_from_asset(self, asset: dict) -> dict:
+-        target = self.build_target_from_asset(asset)
+-        return self.upsert(target["id"], target)
++        return self.build_target_from_asset(asset)
+--- /dev/null
++++ b/data/state/assets/asset-vm-143.json
+@@ -0,0 +1,15 @@
++{
++  "id": "asset-vm-143",
++  "name": "asset-vm-143",
++  "type": "vm",
++  "mgmt_ip": "192.168.208.143",
++  "env": "lab",
++  "roles": [
++    "subagent-node"
++  ],
++  "expected_subagent_port": 55123,
++  "auth_ref": "ssh-lab-default",
++  "metadata": {
++    "os": "ubuntu"
++  }
++}--- /dev/null
++++ b/data/state/assets/asset-vm-144.json
+@@ -0,0 +1,15 @@
++{
++  "id": "asset-vm-144",
++  "name": "asset-vm-144",
++  "type": "vm",
++  "mgmt_ip": "192.168.208.144",
++  "env": "lab",
++  "roles": [
++    "subagent-node"
++  ],
++  "expected_subagent_port": 55123,
++  "auth_ref": "ssh-lab-default",
++  "metadata": {
++    "os": "ubuntu"
++  }
++}--- a/data/state/assets/vm-192-168-208-143.json
++++ /dev/null
+@@ -1,20 +0,0 @@
+-{
+-  "id": "vm-192-168-208-143",
+-  "name": "remote-vm-143",
+-  "kind": "vm",
+-  "address": "192.168.208.143",
+-  "platform": "linux",
+-  "tags": ["remote", "lab"],
+-  "owner": null,
+-  "status": "registered",
+-  "subagent": {
+-    "installed": false,
+-    "reachable": false,
+-    "base_url": "http://192.168.208.143:55123",
+-    "agent_id": null,
+-    "last_seen": null
+-  },
+-  "metadata": {
+-    "expected_subagent_port": 55123
+-  }
+-}
+--- a/data/state/assets/vm-192-168-208-144.json
++++ /dev/null
+@@ -1,20 +0,0 @@
+-{
+-  "id": "vm-192-168-208-144",
+-  "name": "remote-vm-144",
+-  "kind": "vm",
+-  "address": "192.168.208.144",
+-  "platform": "linux",
+-  "tags": ["remote", "lab"],
+-  "owner": null,
+-  "status": "registered",
+-  "subagent": {
+-    "installed": false,
+-    "reachable": false,
+-    "base_url": "http://192.168.208.144:55123",
+-    "agent_id": null,
+-    "last_seen": null
+-  },
+-  "metadata": {
+-    "expected_subagent_port": 55123
+-  }
+-}
+--- a/skills/ops.onboard.two_node/README.md
++++ b/skills/ops.onboard.two_node/README.md
+@@ -1,28 +1,17 @@
+ # ops.onboard.two_node
+ 
+-두 개의 타겟 노드를 ChassisClaw 관리 범위에 편입하기 위한 초기 온보딩 스킬.
++두 개의 자산(asset)을 ChassisClaw 관리 범위에 편입하기 위한 초기 온보딩 스킬.
+ 
+ ## 목적
+-- 두 노드가 등록되어 있는지 확인
+-- 각 노드의 기본 상태와 capabilities를 수집
++- 두 자산이 등록되어 있는지 확인
++- 각 자산에서 resolve된 실행 target의 기본 상태와 capabilities를 수집
+ - subagent 설치 필요 여부를 판단
+ - 설치 승인/차단 사유를 남김
+ - 최종 온보딩 요약을 생성
+ 
+-## 현재 범위
+-이 버전은 실행 로직 완성본이 아니라 스킬 골격이다.
+-즉, LLM/Planner가 선택할 수 있는 대표 스킬의 구조를 먼저 고정하는 단계다.
+-
+ ## 예상 흐름
+-1. target 존재 확인
+-2. node A probe
+-3. node B probe
++1. asset 존재 확인
++2. asset A resolve + probe
++3. asset B resolve + probe
+ 4. 필요 시 subagent 설치 여부 판단
+ 5. 보고서 생성
+-
+-## 이후 확장 예정
+-- 실제 subagent 배포 액션
+-- package manager 자동 판별
+-- SSH/bootstrap wrapper 생성
+-- health 검증 재시도
+-- evidence pack 생성--- a/skills/ops.onboard.two_node/inputs.schema.json
++++ b/skills/ops.onboard.two_node/inputs.schema.json
+@@ -34,4 +34,4 @@
+       "type": "string"
+     }
+   }
+-}+}
+--- a/skills/ops.onboard.two_node/plan.template.json
++++ b/skills/ops.onboard.two_node/plan.template.json
+@@ -1,6 +1,6 @@
+ {
+   "skill_id": "ops.onboard.two_node",
+-  "goal": "Onboard two nodes into ChassisClaw management scope",
++  "goal": "Onboard two assets into ChassisClaw management scope",
+   "jobs": [
+     {
+       "id": "check_assets_exist",
+@@ -10,14 +10,14 @@
+     {
+       "id": "probe_node_a",
+       "type": "probe",
+-      "asset_input": "node_a_asset_id",
+-      "description": "Collect health and capability facts from node A"
++      "target_input": "node_a_asset_id",
++      "description": "Collect health and capability facts from asset A via resolved target"
+     },
+     {
+       "id": "probe_node_b",
+       "type": "probe",
+-      "asset_input": "node_b_asset_id",
+-      "description": "Collect health and capability facts from node B"
++      "target_input": "node_b_asset_id",
++      "description": "Collect health and capability facts from asset B via resolved target"
+     },
+     {
+       "id": "decide_subagent_install",
+@@ -27,7 +27,7 @@
+     {
+       "id": "install_subagent",
+       "type": "install",
+-      "description": "Install or prepare subagent bootstrap on targets that require approval"
++      "description": "Install or prepare subagent bootstrap on assets that require approval"
+     },
+     {
+       "id": "report_summary",
+@@ -41,4 +41,4 @@
+     "install_subagent_plan.json",
+     "onboarding_summary.json"
+   ]
+-}+}
+--- a/skills/ops.onboard.two_node/skill.json
++++ b/skills/ops.onboard.two_node/skill.json
+@@ -3,7 +3,7 @@
+   "name": "Two Node Onboarding",
+   "version": "0.1.0",
+   "category": "operations",
+-  "description": "Onboard two target nodes by checking reachability, probing capabilities, and preparing agent deployment prerequisites.",
++  "description": "Onboard two assets by checking reachability, probing subagent capabilities, and preparing deployment prerequisites.",
+   "kind": "skill",
+   "required_inputs": [
+     "node_a_asset_id",
+@@ -25,14 +25,14 @@
+   ],
+   "validation": {
+     "success_conditions": [
+-      "both_targets_exist",
+-      "both_targets_reachable_or_reason_captured",
++      "both_assets_exist",
++      "both_assets_reachable_or_reason_captured",
+       "capabilities_collected_or_reason_captured"
+     ],
+     "failure_conditions": [
+-      "target_missing",
++      "asset_missing",
+       "all_probes_failed",
+       "subagent_install_requested_but_not_approved"
+     ]
+   }
+-}+}
